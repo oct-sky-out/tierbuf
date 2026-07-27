@@ -1,0 +1,22 @@
+[workspace]
+members = [
+    "crates/tierbuf",
+    "crates/tierbuf-bench",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+criterion = "0.5"
+crossbeam-queue = "0.3"
+io-uring = "0.7"
+libc = "0.2"
+metrics = "0.24"
+proptest = "1.6"
+thiserror = "2.0"
+tierbuf = { path = "crates/tierbuf" }

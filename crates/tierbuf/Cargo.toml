@@ -1,0 +1,32 @@
+[package]
+name = "tierbuf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file = "../../LICENSE"
+description = "A tier-aware buffer manager for DRAM and lower storage tiers"
+readme = "../../README.md"
+documentation = "https://docs.rs/tierbuf"
+keywords = ["buffer-pool", "cache", "nvme", "storage"]
+categories = ["caching", "data-structures", "filesystem"]
+
+[features]
+default = ["uring"]
+uring = ["dep:io-uring"]
+
+[dependencies]
+crossbeam-queue.workspace = true
+libc.workspace = true
+metrics.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "fix_paths"
+harness = false

@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: no default features
+            feature_args: --no-default-features
+          - label: default (io_uring)
+            feature_args: ""
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets ${{ matrix.feature_args }} -- -D warnings
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets ${{ matrix.feature_args }}
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps ${{ matrix.feature_args }}
+
+  degradation-script:
+    name: Degradation checker tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run Python unit tests
+        run: python -m unittest scripts/test_degradation.py scripts/test_visualize_bench.py scripts/test_bench_duration_sweep.py
+
+  degradation-quick:
+    name: Quick degradation curve
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Measure the CI curve
+        run: cargo run -p tierbuf-bench --release -- --ci --output results/curve.csv
+
+      - name: Reject performance cliffs
+        run: python scripts/degradation.py results/curve.csv
+
+      - name: Render the HTML report
+        run: python scripts/visualize_bench.py results/curve.csv --output results/curve.html
+
+      - name: Upload the measured curve
+        uses: actions/upload-artifact@v4
+        with:
+          name: degradation-curve-quick
+          path: |
+            results/curve.csv
+            results/curve.html
+
+  degradation-nightly:
+    name: Full degradation curve
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install plotting support
+        run: python -m pip install matplotlib
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Measure the full curve
+        run: cargo run -p tierbuf-bench --release -- --file-tier /tmp/tierbuf-tier.bin --output results/curve.csv
+
+      - name: Reject cliffs and render the graph
+        run: python scripts/degradation.py results/curve.csv --plot results/curve.png
+
+      - name: Render the HTML report
+        run: python scripts/visualize_bench.py results/curve.csv --output results/curve.html
+
+      - name: Upload the full curve and graph
+        uses: actions/upload-artifact@v4
+        with:
+          name: degradation-curve-full
+          path: |
+            results/curve.csv
+            results/curve.png
+            results/curve.html
+
+  degradation-duration-sweep:
+    name: Duration sweep degradation curves
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Measure 5s, 10s, 30s, and 60s curves and render dashboard
+        run: python scripts/bench_duration_sweep.py
+
+      - name: Reject cliffs in every duration curve
+        run: |
+          python scripts/degradation.py results/duration-sweep/curve-5s.csv
+          python scripts/degradation.py results/duration-sweep/curve-10s.csv
+          python scripts/degradation.py results/duration-sweep/curve-30s.csv
+          python scripts/degradation.py results/duration-sweep/curve-60s.csv
+
+      - name: Upload the duration sweep curves and dashboard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: degradation-duration-sweep
+          path: |
+            results/duration-sweep/curve-5s.csv
+            results/duration-sweep/curve-10s.csv
+            results/duration-sweep/curve-30s.csv
+            results/duration-sweep/curve-60s.csv
+            results/duration-sweep/dashboard.html
+
+  stress-nightly:
+    name: Five-minute randomized stress
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run restart-and-resize stress
+        run: sh scripts/stress.sh 300
+
+  miri:
+    name: Miri (aligned pool, latch, and Swip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install nightly Rust with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Prepare the Miri sysroot
+        run: cargo +nightly miri setup
+
+      - name: Run aligned-pool tests under Miri
+        run: "cargo +nightly miri test -p tierbuf --lib --no-default-features sys::mmap::tests::"
+
+      - name: Run latch tests under Miri
+        run: "cargo +nightly miri test -p tierbuf --lib --no-default-features latch::tests::"
+
+      - name: Run Swip tests under Miri
+        run: "cargo +nightly miri test -p tierbuf --lib --no-default-features swip::tests::"

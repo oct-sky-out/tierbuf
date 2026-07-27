@@ -1,0 +1,3 @@
+fraction,throughput_ops,p50_us,p99_us,cost_usd_per_1e6ops
+1.0,1000,10,100,1.00
+1.0,500,20,200,0.80

@@ -1,0 +1,11 @@
+[package]
+name = "tierbuf-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Benchmark harness for tierbuf degradation curves"
+
+[dependencies]
+tierbuf.workspace = true

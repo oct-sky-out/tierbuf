@@ -1,0 +1,229 @@
+# tierbuf
+
+**DRAM, NVMe, and future storage tiers managed as one embeddable page space.**
+
+**DRAM 가격 위기에 대한 아키텍처적 응답.**
+
+tierbuf is a Rust buffer-manager kernel built around fixed 64 KiB pages,
+aligned DRAM frames, and explicit lower storage tiers. It gives storage engines
+a small mechanism layer they can embed instead of coupling them to an async
+runtime or a complete database.
+
+DRAM capacity is increasingly an economic constraint, not just a hardware
+sizing choice. Hot data keeps the direct-access path it deserves, while colder
+data can move to less expensive media without splitting the application's
+logical address space.
+
+The project treats graceful degradation as a contract. Pointer swizzling,
+optimistic latching, measured access heat, placement economics, background
+prefetch, and degradation-curve CI make reducing the DRAM fraction a measured
+slope rather than a silent performance cliff.
+
+## Architecture
+
+```text
+ Application / storage engine
+       │ owns canonical Swip clones
+       ▼
+┌──────────────────────── BufferManager ────────────────────────┐
+│ allocate / fix_shared / fix_exclusive                         │
+│                                                              │
+│  resident fast path                 fault / write-back path   │
+│  Swip ── ResidentAddr ─────┐       ┌── PageDirectory(pid)     │
+│                            ▼       ▼                          │
+│                    ┌───────────────┐                          │
+│                    │  FrameTable   │                          │
+│                    │ metadata Box  │                          │
+│                    │ + free queue  │                          │
+│                    └───────┬───────┘                          │
+│                            │ same frame index                 │
+│                    ┌───────▼───────┐                          │
+│                    │ AlignedPool   │  anonymous mmap          │
+│                    │ 64 KiB pages  │                          │
+│                    └───────┬───────┘                          │
+└────────────────────────────┼──────────────────────────────────┘
+                             │ TierBackend
+                   ┌─────────┴─────────┐
+                   ▼                   ▼
+              FileTier             MockTier
+          O_DIRECT/buffered     deterministic tests
+```
+
+A resident fix follows the tagged `Swip` directly and does not consult the page
+directory. Only an evicted page enters the coalesced fault path and reads its
+recorded lower-tier location. See [Architecture and invariants](docs/architecture.md)
+for the state machine, pin/eviction ordering, tier authority, and module map.
+
+## Current v0.1 scope
+
+The kernel includes:
+
+- a single anonymous `mmap` DRAM pool with 64 KiB-aligned frames;
+- stable, cloneable `Swip` handles with `Hot`, `Cooling`, and `Evicted` states;
+- hybrid shared/exclusive/optimistic latching and closure-scoped byte access;
+- allocation, resident fixes, coalesced lower-tier faults, and a
+  page directory that stays off the resident hot path;
+- `FileTier` and deterministic `MockTier` implementations of `TierBackend`,
+  including write-budget and latency metadata;
+- lock-free frame free-list and pin-versus-eviction reservation mechanics;
+- lazy 8.24 fixed-point heat tracking, economic placement decisions, metrics,
+  and cost accounting;
+- autonomous cooling, generation-checked eviction, and write-budget fallback;
+- bounded nonblocking prefetch with failure cleanup and generation-exact
+  one-shot hit tracking;
+- optional Linux `io_uring` reads (enabled by default) through a dedicated
+  concurrent completion thread, with portable backend fallback;
+- a deterministic degradation-curve harness, checker, and scheduled CI jobs.
+
+## Embed in 5 min
+
+The example uses the current public synchronous API. Keep the `Swip` returned
+by the allocation guard; independently reconstructing a handle for the same
+page ID is deliberately rejected.
+
+```rust
+use tierbuf::PAGE_SIZE;
+use tierbuf::pool::{BufConfig, BufferManager, Economics};
+use tierbuf::tier::mock::MockTier;
+use tierbuf::tier::TierBackend;
+
+fn main() -> tierbuf::Result<()> {
+    let cold = MockTier::new((PAGE_SIZE * 128) as u64)?;
+    let manager = BufferManager::new(BufConfig {
+        dram_pool_bytes: PAGE_SIZE * 16,
+        cooling_ratio: 0.1,
+        economics: Economics::default(),
+        tiers: vec![Box::new(cold) as Box<dyn TierBackend>],
+    })?;
+
+    let mut allocated = manager.allocate()?;
+    let swip = allocated.swip();
+    allocated.write_with(|page| {
+        page[..8].copy_from_slice(b"tierbuf!");
+    });
+    drop(allocated);
+
+    let shared = manager.fix_shared(&swip)?;
+    shared.read_with(|page| {
+        assert_eq!(&page[..8], b"tierbuf!");
+    });
+    drop(shared);
+
+    println!("{}", manager.cost_report());
+
+    Ok(())
+}
+```
+
+`write_with` and `read_with` intentionally keep page references inside the
+guard's latch lifetime. The returned data cannot escape validation or outlive
+its pin.
+
+After at least one configured epoch, the cost report renders actual residency
+beside the all-DRAM counterfactual:
+
+```text
+tierbuf cost: actual $0.000000001, all-DRAM $0.000000004 (0.250x)
+  dram: 0.000977 GiB·s, $0.000000002
+  mock: 0.003906 GiB·s, $0.000000001
+```
+
+## Degradation curve
+
+```bash
+cargo run -p tierbuf-bench --release -- --quick
+python3 scripts/degradation.py results/curve.csv --plot results/curve.png
+python3 scripts/visualize_bench.py results/curve.csv --output results/curve.html
+```
+
+The checker rejects any adjacent DRAM-fraction pair whose throughput ratio is
+greater than 3.0 or whose p99 ratio is greater than 4.0. Scheduled CI publishes
+the full 4 GiB CSV and graph; this repository keeps a placeholder until a
+reference hardware run is selected.
+
+`scripts/visualize_bench.py` renders a dependency-free English HTML dashboard
+from one or more benchmark CSVs. Multiple runs can be compared directly:
+
+```bash
+python3 scripts/visualize_bench.py run-a.csv run-b.csv \
+  --labels "quick run A" "quick run B" \
+  --output results/curve.html
+```
+
+For the standard 5s, 10s, 30s, and 60s measurement cases, use the duration
+sweep wrapper. It writes one CSV per duration and then renders the same
+dashboard:
+
+```bash
+python3 scripts/bench_duration_sweep.py
+```
+
+By default this uses a practical local profile: 256 MiB dataset, 1s warmup per
+fraction, 4 workers, and release mode. Override sizing when a heavier reference
+run is needed:
+
+```bash
+python3 scripts/bench_duration_sweep.py --dataset-mib 4096 --warmup-secs 10
+```
+
+Scheduled and manual CI runs publish the same sweep as the
+`degradation-duration-sweep` artifact, including:
+
+- `curve-5s.csv`
+- `curve-10s.csv`
+- `curve-30s.csv`
+- `curve-60s.csv`
+- `dashboard.html`
+
+Point operations validate their record marker. Scan operations consume the
+complete 64 KiB page through a two-lane digest, so the 70/30 workload measures
+real page processing instead of comparing lower-tier I/O with a one-byte
+synthetic hot path. `--file-tier PATH` selects local file storage;
+`--scan-only --prefetch-scan --mock-latency-us 200` provides the prefetch
+on/off comparison profile.
+
+![Degradation curve placeholder](docs/degradation-curve-placeholder.svg)
+
+The ignored release stress can be exercised at its full five-minute duration:
+
+```bash
+sh scripts/stress.sh 300
+```
+
+## Safety corrections
+
+The implementation tightens several contracts from the original design plan:
+
+- a frame retains an `Arc`-backed owner `Swip` clone instead of a movable raw
+  backpointer;
+- one atomic pin-control word makes pin acquisition mutually exclusive with
+  the exact `0 → EVICTING` reservation;
+- per-page fault generations coalesce one backing read and replay its same
+  outcome to every registered waiter;
+- safe page APIs use latch-scoped closures rather than exposing optimistic
+  references to concurrently mutable bytes;
+- direct and asynchronous I/O capabilities are treated as platform-specific;
+  native requests own aligned buffers until a dedicated ring thread observes
+  their completions, with explicit portable fallbacks.
+
+The rationale and exact invariants are recorded in
+[v0.1 safety corrections](docs/design-corrections.md).
+
+## Non-goals
+
+v0.1 is an ephemeral cache/buffer-manager layer, not a database. It does not
+provide crash recovery, WAL, transactions, MVCC, or index structures. The
+latest lower-tier location is authoritative after write-back, but the
+directory itself is not persisted across process restarts.
+
+Variable-size pages, compression, object storage, JVM bindings, and distributed
+cooperative caching are intentionally outside v0.1.
+
+## Roadmap
+
+- **v0.1 (current):** fixed-page tiering kernel described above; scheduled CI
+  publishes the first reference degradation curve.
+- **v0.2:** S3/object-storage tiers, variable-size pages, and LZ4-compressed
+  resident pages.
+- **v0.3:** Project Panama bindings for direct JVM/Kotlin/Spark embedding.
+- **v0.4:** distributed cooperative caching with consistent-hash placement.
