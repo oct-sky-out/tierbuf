@@ -83,7 +83,7 @@ page ID is deliberately rejected.
 
 ```rust
 use tierbuf::PAGE_SIZE;
-use tierbuf::pool::{BufConfig, BufferManager, Economics};
+use tierbuf::pool::{BufConfig, BufferManager, Economics, EvictionMode};
 use tierbuf::tier::mock::MockTier;
 use tierbuf::tier::TierBackend;
 
@@ -92,6 +92,7 @@ fn main() -> tierbuf::Result<()> {
     let manager = BufferManager::new(BufConfig {
         dram_pool_bytes: PAGE_SIZE * 16,
         cooling_ratio: 0.1,
+        eviction_mode: EvictionMode::Demand,
         economics: Economics::default(),
         tiers: vec![Box::new(cold) as Box<dyn TierBackend>],
     })?;
@@ -181,6 +182,25 @@ real page processing instead of comparing lower-tier I/O with a one-byte
 synthetic hot path. `--file-tier PATH` selects local file storage;
 `--scan-only --prefetch-scan --mock-latency-us 200` provides the prefetch
 on/off comparison profile.
+
+Each benchmark CSV also separates point and scan traffic into operation count,
+throughput, p50, p99, and DRAM hit-rate columns. `dram_hit_rate` is the
+fraction of completed demand fixes served by an already-resident frame;
+`lower_tier_hit_rate` is the fraction restored from a configured lower tier.
+The two rates sum to 1.0 and exclude speculative prefetch I/O.
+`point_dram_hit_rate` and `scan_dram_hit_rate` attribute those hits to the
+operation that completed the fix. Both the PNG plotter and standalone HTML
+dashboard automatically add operation-type and tier-hit panels when these
+extended columns are present, while continuing to accept older five-column
+CSV files.
+
+The background cooler defaults to `EvictionMode::Demand`, which maintains the
+low watermark only during epochs containing demand fault-ins.
+`EvictionMode::Watermark` preserves the original always-on low-watermark
+behavior for A/B comparisons. The benchmark accepts
+`--eviction-mode demand|watermark`, `--fraction`, and `--stats-output`; the
+JSON stats artifact records cumulative and measurement-window fixes,
+evictions, second chances, and per-tier I/O.
 
 ![Degradation curve placeholder](docs/degradation-curve-placeholder.svg)
 

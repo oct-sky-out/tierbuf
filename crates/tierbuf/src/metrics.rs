@@ -16,6 +16,12 @@ pub struct TierCounters {
     /// Stable tier name supplied when the recorder was created.
     pub name: String,
 
+    /// Completed demand fixes restored from this tier.
+    ///
+    /// Prefetch I/O is intentionally excluded so this counter can be used
+    /// with `dram_hits` to calculate demand hit rates.
+    pub demand_hits: u64,
+
     /// Completed page reads from this tier.
     pub reads: u64,
 
@@ -91,6 +97,11 @@ impl TierStats {
 
         for tier in &self.tiers {
             metrics::counter!(
+                "tierbuf_tier_demand_hits_total",
+                "tier" => tier.name.clone()
+            )
+            .absolute(tier.demand_hits);
+            metrics::counter!(
                 "tierbuf_tier_reads_total",
                 "tier" => tier.name.clone()
             )
@@ -117,6 +128,7 @@ impl TierStats {
 #[derive(Debug, Default)]
 struct AtomicTierCounters {
     name: String,
+    demand_hits: AtomicU64,
     reads: AtomicU64,
     writes: AtomicU64,
     bytes_read: AtomicU64,
@@ -224,6 +236,17 @@ impl StatsRecorder {
         saturating_add(&self.budget_denied, 1);
     }
 
+    /// Records one completed demand fix restored from a lower tier.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `tier_index` is outside configured tier order.
+    pub(crate) fn record_tier_demand_hit(&self, tier_index: usize) {
+        let _update = self.begin_update();
+        let tier = self.tier(tier_index);
+        saturating_add(&tier.demand_hits, 1);
+    }
+
     /// Records one completed lower-tier read and its byte count.
     ///
     /// # Panics
@@ -265,6 +288,7 @@ impl StatsRecorder {
                 .iter()
                 .map(|tier| TierCounters {
                     name: tier.name.clone(),
+                    demand_hits: load(&tier.demand_hits),
                     reads: load(&tier.reads),
                     writes: load(&tier.writes),
                     bytes_read: load(&tier.bytes_read),
@@ -588,6 +612,7 @@ mod tests {
         recorder.record_prefetch_hit();
         recorder.record_prefetch_skipped(2);
         recorder.record_budget_denied();
+        recorder.record_tier_demand_hit(0);
         recorder.record_tier_read(0, 64 * 1024);
         recorder.record_tier_read(0, 64 * 1024);
         recorder.record_tier_write(1, 64 * 1024);
@@ -604,6 +629,7 @@ mod tests {
             tiers: vec![
                 super::TierCounters {
                     name: "nvme".to_owned(),
+                    demand_hits: 1,
                     reads: 2,
                     writes: 0,
                     bytes_read: 128 * 1024,
@@ -611,6 +637,7 @@ mod tests {
                 },
                 super::TierCounters {
                     name: "cold".to_owned(),
+                    demand_hits: 0,
                     reads: 0,
                     writes: 1,
                     bytes_read: 0,
@@ -638,6 +665,7 @@ mod tests {
                     for _ in 0..ITERATIONS {
                         recorder.record_dram_hit();
                         recorder.record_fault();
+                        recorder.record_tier_demand_hit(0);
                         recorder.record_tier_read(0, BYTES);
                         recorder.record_tier_write(0, BYTES);
                     }
@@ -653,6 +681,7 @@ mod tests {
         let snapshot = recorder.snapshot();
         assert_eq!(snapshot.dram_hits, expected_events);
         assert_eq!(snapshot.faults, expected_events);
+        assert_eq!(snapshot.tiers[0].demand_hits, expected_events);
         assert_eq!(snapshot.tiers[0].reads, expected_events);
         assert_eq!(snapshot.tiers[0].writes, expected_events);
         assert_eq!(snapshot.tiers[0].bytes_read, expected_events * BYTES);

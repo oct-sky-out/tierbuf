@@ -29,6 +29,17 @@ class DegradationCheckerTests(unittest.TestCase):
         self.assertAlmostEqual(checks[0].throughput_ratio, 2.0)
         self.assertAlmostEqual(checks[0].p99_ratio, 1.5)
 
+    def test_extended_metrics_are_loaded_and_hit_rates_are_normalized(self) -> None:
+        points = degradation.load_curve(FIXTURES / "extended.csv")
+
+        self.assertTrue(all(point.has_extended_metrics for point in points))
+        self.assertEqual(points[0].point_ops, 700.0)
+        self.assertEqual(points[0].scan_ops, 300.0)
+        self.assertAlmostEqual(points[0].dram_hit_rate, 0.95)
+        self.assertAlmostEqual(points[0].lower_tier_hit_rate, 0.05)
+        self.assertAlmostEqual(points[0].point_dram_hit_rate, 0.98)
+        self.assertAlmostEqual(points[0].scan_dram_hit_rate, 0.88)
+
     def test_throughput_cliff_uses_high_over_next_lower(self) -> None:
         checks = degradation.check_curve(
             degradation.load_curve(FIXTURES / "throughput_cliff.csv")
@@ -64,6 +75,7 @@ class DegradationCheckerTests(unittest.TestCase):
             "invalid_nonpositive.csv",
             "invalid_duplicate.csv",
             "invalid_nonfinite.csv",
+            "invalid_extended_schema.csv",
         )
 
         for filename in invalid_fixtures:
@@ -91,6 +103,7 @@ class DegradationCheckerTests(unittest.TestCase):
             "invalid_nonpositive.csv",
             "invalid_duplicate.csv",
             "invalid_nonfinite.csv",
+            "invalid_extended_schema.csv",
         ):
             with self.subTest(fixture_name=fixture_name):
                 invalid = self.run_cli(fixture_name)

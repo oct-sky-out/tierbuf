@@ -11,8 +11,10 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use serde_json::{Value, json};
+use tierbuf::metrics::{TierCounters, TierStats};
 use tierbuf::policy::AccessHint;
-use tierbuf::pool::{BufConfig, BufferManager, Economics};
+use tierbuf::pool::{BufConfig, BufferManager, Economics, EvictionMode, FixSource};
 use tierbuf::swip::Swip;
 use tierbuf::tier::file::{FileTier, FileTierConfig};
 use tierbuf::tier::mock::MockTier;
@@ -26,6 +28,7 @@ const DEFAULT_MEASUREMENT: Duration = Duration::from_secs(30);
 const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_MOCK_LATENCY_US: u64 = 80;
 const DEFAULT_OUTPUT: &str = "results/curve.csv";
+const DEFAULT_STATS_OUTPUT: &str = "results/stats.json";
 const ECONOMIC_EPOCH: Duration = Duration::from_millis(100);
 const DRAM_PRICE_GIB_MONTH: f64 = 4.5;
 const MOCK_PRICE_GIB_MONTH: f64 = 0.08;
@@ -37,7 +40,12 @@ const SAMPLE_EVERY_OPERATIONS: u64 = 64;
 const MAX_LATENCY_SAMPLES_PER_WORKER: usize = 50_000;
 const RESOURCE_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const RESOURCE_RETRY_PAUSE: Duration = Duration::from_micros(100);
-const CSV_HEADER: &str = "fraction,throughput_ops,p50_us,p99_us,cost_usd_per_1e6ops\n";
+const CSV_HEADER: &str = concat!(
+    "fraction,throughput_ops,p50_us,p99_us,cost_usd_per_1e6ops,",
+    "point_ops,point_throughput_ops,point_p50_us,point_p99_us,",
+    "scan_ops,scan_throughput_ops,scan_p50_us,scan_p99_us,",
+    "dram_hit_rate,lower_tier_hit_rate,point_dram_hit_rate,scan_dram_hit_rate\n"
+);
 const WORKLOAD_SEED: u64 = 0x6a09_e667_f3bc_c909;
 const MEASUREMENT_SEED_SALT: u64 = 0xbb67_ae85_84ca_a73b;
 const SAMPLE_SEED_SALT: u64 = 0x3c6e_f372_fe94_f82b;
@@ -74,6 +82,7 @@ fn run_from_env() -> Result<(), String> {
 fn run_benchmark(config: &Config) -> Result<(), String> {
     let layout = config.dataset_layout()?;
     let mut output = CsvOutput::open(&config.output)?;
+    let mut stats_runs = Vec::with_capacity(config.fractions.len());
 
     println!(
         "tierbuf degradation curve: {} MiB, {} workers, {:.3}s warmup, {:.3}s measurement",
@@ -83,18 +92,20 @@ fn run_benchmark(config: &Config) -> Result<(), String> {
         config.measurement.as_secs_f64()
     );
 
-    for fraction in DRAM_FRACTIONS {
+    for &fraction in &config.fractions {
         eprintln!(
             "fraction {}: initializing {} pages in {} DRAM frames",
             fraction.label(),
             layout.page_count,
             fraction.dram_pages(layout.page_count)?
         );
-        let row = run_fraction(config, layout, fraction)?;
+        let (row, stats) = run_fraction(config, layout, fraction)?;
         output.append(&row)?;
+        stats_runs.push(stats);
         println!("{}", format_csv_row(&row).trim_end());
     }
 
+    write_stats_json(&config.stats_output, &stats_runs)?;
     Ok(())
 }
 
@@ -102,7 +113,7 @@ fn run_fraction(
     config: &Config,
     layout: DatasetLayout,
     fraction: DramFraction,
-) -> Result<BenchRow, String> {
+) -> Result<(BenchRow, Value), String> {
     let manager = make_manager(config, layout, fraction)?;
 
     let benchmark_result = (|| {
@@ -123,6 +134,7 @@ fn run_fraction(
         )?;
 
         let cost_before = manager.cost_report().actual_cost_usd;
+        let stats_before = manager.stats();
         let measured = run_phase(
             &manager,
             &swips,
@@ -136,19 +148,27 @@ fn run_fraction(
             },
         )?;
         let cost_after = manager.cost_report().actual_cost_usd;
-        let stats = manager.stats();
+        let stats_after = manager.stats();
         eprintln!(
             "fraction {}: hits={} faults={} evictions={} prefetch={}/{} skipped={}",
             fraction.label(),
-            stats.dram_hits,
-            stats.faults,
-            stats.evictions,
-            stats.prefetch_hits,
-            stats.prefetch_submitted,
-            stats.prefetch_skipped
+            stats_after.dram_hits,
+            stats_after.faults,
+            stats_after.evictions,
+            stats_after.prefetch_hits,
+            stats_after.prefetch_submitted,
+            stats_after.prefetch_skipped
         );
 
-        BenchRow::from_measurement(fraction, measured, (cost_after - cost_before).max(0.0))
+        let stats_dump = fraction_stats_json(fraction, &measured, &stats_before, &stats_after)?;
+        let row = BenchRow::from_measurement(
+            fraction,
+            measured,
+            (cost_after - cost_before).max(0.0),
+            &stats_before,
+            &stats_after,
+        )?;
+        Ok((row, stats_dump))
     })();
 
     let shutdown_result = manager
@@ -156,12 +176,169 @@ fn run_fraction(
         .map_err(|error| format!("failed to shut down fraction {}: {error}", fraction.label()));
 
     match (benchmark_result, shutdown_result) {
-        (Ok(row), Ok(())) => Ok(row),
+        (Ok(result), Ok(())) => Ok(result),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Err(benchmark_error), Err(shutdown_error)) => {
             Err(format!("{benchmark_error}; additionally, {shutdown_error}"))
         }
     }
+}
+
+fn write_stats_json(path: &Path, runs: &[Value]) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create stats output directory '{}': {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let file = File::create(path)
+        .map_err(|error| format!("failed to open stats output '{}': {error}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(
+        &mut writer,
+        &json!({
+            "schema_version": 1,
+            "capture_point": "after_measurement_before_shutdown",
+            "runs": runs,
+        }),
+    )
+    .map_err(|error| {
+        format!(
+            "failed to serialize stats output '{}': {error}",
+            path.display()
+        )
+    })?;
+    writer
+        .write_all(b"\n")
+        .and_then(|()| writer.flush())
+        .map_err(|error| format!("failed to flush stats output '{}': {error}", path.display()))
+}
+
+fn fraction_stats_json(
+    fraction: DramFraction,
+    measured: &PhaseResult,
+    stats_before: &TierStats,
+    stats_after: &TierStats,
+) -> Result<Value, String> {
+    let measurement_stats = tier_stats_delta(stats_before, stats_after)?;
+    Ok(json!({
+        "fraction": fraction.label(),
+        "measurement_seconds": measured.elapsed.as_secs_f64(),
+        "measurement_operations": {
+            "total": measured.operations,
+            "point": measured.point_operations,
+            "scan": measured.scan_operations,
+            "point_dram_hits": measured.point_dram_hits,
+            "scan_dram_hits": measured.scan_dram_hits,
+        },
+        "measurement_stats": tier_stats_json(&measurement_stats),
+        "cumulative_stats": tier_stats_json(stats_after),
+    }))
+}
+
+fn tier_stats_json(stats: &TierStats) -> Value {
+    let lower_tier_fixes = stats.tiers.iter().map(|tier| tier.demand_hits).sum::<u64>();
+    json!({
+        "total_fixes": stats.dram_hits.saturating_add(lower_tier_fixes),
+        "dram_hits": stats.dram_hits,
+        "faults": stats.faults,
+        "evictions": stats.evictions,
+        "second_chances": stats.second_chances,
+        "prefetch_submitted": stats.prefetch_submitted,
+        "prefetch_hits": stats.prefetch_hits,
+        "prefetch_skipped": stats.prefetch_skipped,
+        "budget_denied": stats.budget_denied,
+        "tiers": stats.tiers.iter().map(|tier| json!({
+            "name": tier.name,
+            "demand_hits": tier.demand_hits,
+            "reads": tier.reads,
+            "writes": tier.writes,
+            "bytes_read": tier.bytes_read,
+            "bytes_written": tier.bytes_written,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn tier_stats_delta(before: &TierStats, after: &TierStats) -> Result<TierStats, String> {
+    if before.tiers.len() != after.tiers.len()
+        || before
+            .tiers
+            .iter()
+            .zip(&after.tiers)
+            .any(|(before_tier, after_tier)| before_tier.name != after_tier.name)
+    {
+        return Err("tier stats changed shape during measurement".to_owned());
+    }
+
+    let delta = |name: &str, before: u64, after: u64| {
+        after
+            .checked_sub(before)
+            .ok_or_else(|| format!("{name} counter regressed during measurement"))
+    };
+    let tiers = before
+        .tiers
+        .iter()
+        .zip(&after.tiers)
+        .map(|(before_tier, after_tier)| {
+            Ok(TierCounters {
+                name: after_tier.name.clone(),
+                demand_hits: delta(
+                    &format!("{} demand hits", after_tier.name),
+                    before_tier.demand_hits,
+                    after_tier.demand_hits,
+                )?,
+                reads: delta(
+                    &format!("{} reads", after_tier.name),
+                    before_tier.reads,
+                    after_tier.reads,
+                )?,
+                writes: delta(
+                    &format!("{} writes", after_tier.name),
+                    before_tier.writes,
+                    after_tier.writes,
+                )?,
+                bytes_read: delta(
+                    &format!("{} bytes read", after_tier.name),
+                    before_tier.bytes_read,
+                    after_tier.bytes_read,
+                )?,
+                bytes_written: delta(
+                    &format!("{} bytes written", after_tier.name),
+                    before_tier.bytes_written,
+                    after_tier.bytes_written,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(TierStats {
+        dram_hits: delta("DRAM hits", before.dram_hits, after.dram_hits)?,
+        faults: delta("faults", before.faults, after.faults)?,
+        evictions: delta("evictions", before.evictions, after.evictions)?,
+        second_chances: delta(
+            "second chances",
+            before.second_chances,
+            after.second_chances,
+        )?,
+        prefetch_submitted: delta(
+            "prefetch submitted",
+            before.prefetch_submitted,
+            after.prefetch_submitted,
+        )?,
+        prefetch_hits: delta("prefetch hits", before.prefetch_hits, after.prefetch_hits)?,
+        prefetch_skipped: delta(
+            "prefetch skipped",
+            before.prefetch_skipped,
+            after.prefetch_skipped,
+        )?,
+        budget_denied: delta("budget denied", before.budget_denied, after.budget_denied)?,
+        tiers,
+    })
 }
 
 fn make_manager(
@@ -203,6 +380,7 @@ fn make_manager(
     BufferManager::new(BufConfig {
         dram_pool_bytes,
         cooling_ratio: 0.1,
+        eviction_mode: config.eviction_mode,
         economics: Economics {
             dram_price_gb_month: DRAM_PRICE_GIB_MONTH,
             epoch: ECONOMIC_EPOCH,
@@ -302,13 +480,25 @@ fn run_phase(
     start.wait();
 
     let mut operations = 0_u64;
+    let mut point_operations = 0_u64;
+    let mut scan_operations = 0_u64;
+    let mut point_dram_hits = 0_u64;
+    let mut scan_dram_hits = 0_u64;
     let mut latencies_ns = Vec::new();
+    let mut point_latencies_ns = Vec::new();
+    let mut scan_latencies_ns = Vec::new();
     let mut first_error = None;
     for handle in handles {
         match handle.join() {
             Ok(Ok(worker)) => {
                 operations = operations.saturating_add(worker.operations);
+                point_operations = point_operations.saturating_add(worker.point_operations);
+                scan_operations = scan_operations.saturating_add(worker.scan_operations);
+                point_dram_hits = point_dram_hits.saturating_add(worker.point_dram_hits);
+                scan_dram_hits = scan_dram_hits.saturating_add(worker.scan_dram_hits);
                 latencies_ns.extend(worker.latencies_ns);
+                point_latencies_ns.extend(worker.point_latencies_ns);
+                scan_latencies_ns.extend(worker.scan_latencies_ns);
             }
             Ok(Err(error)) => {
                 first_error.get_or_insert(error);
@@ -325,8 +515,14 @@ fn run_phase(
 
     Ok(PhaseResult {
         operations,
+        point_operations,
+        scan_operations,
+        point_dram_hits,
+        scan_dram_hits,
         elapsed: phase_start.elapsed(),
         latencies_ns,
+        point_latencies_ns,
+        scan_latencies_ns,
     })
 }
 
@@ -349,7 +545,19 @@ fn run_worker(
     let mut workload = WorkloadState::new(seed, scan_start);
     let mut latency_sampler =
         LatencySampler::new(seed ^ SAMPLE_SEED_SALT, MAX_LATENCY_SAMPLES_PER_WORKER);
+    let mut point_latency_sampler = LatencySampler::new(
+        seed ^ SAMPLE_SEED_SALT.rotate_left(17),
+        MAX_LATENCY_SAMPLES_PER_WORKER,
+    );
+    let mut scan_latency_sampler = LatencySampler::new(
+        seed ^ SAMPLE_SEED_SALT.rotate_left(31),
+        MAX_LATENCY_SAMPLES_PER_WORKER,
+    );
     let mut operations = 0_u64;
+    let mut point_operations = 0_u64;
+    let mut scan_operations = 0_u64;
+    let mut point_dram_hits = 0_u64;
+    let mut scan_dram_hits = 0_u64;
 
     while Instant::now() < run.deadline {
         let point_access_percent = if run.scan_only {
@@ -358,21 +566,60 @@ fn run_worker(
             POINT_ACCESS_PERCENT
         };
         let access = workload.next_access(&zipf, point_access_percent);
-        let should_sample = matches!(run.phase, Phase::Measurement)
-            && operations.is_multiple_of(SAMPLE_EVERY_OPERATIONS);
-        let operation_start = should_sample.then(Instant::now);
+        let measurement = matches!(run.phase, Phase::Measurement);
+        let sample_overall = measurement && operations.is_multiple_of(SAMPLE_EVERY_OPERATIONS);
+        let sample_kind = measurement
+            && match access.hint {
+                AccessHint::Normal => point_operations.is_multiple_of(SAMPLE_EVERY_OPERATIONS),
+                AccessHint::Scan => scan_operations.is_multiple_of(SAMPLE_EVERY_OPERATIONS),
+                AccessHint::Prefetch => unreachable!("workload never emits prefetch accesses"),
+            };
+        let operation_start = (sample_overall || sample_kind).then(Instant::now);
 
-        fix_and_verify(&manager, &swips, access, run.prefetch_scan)?;
+        let source = fix_and_verify(&manager, &swips, access, run.prefetch_scan)?;
 
         if let Some(operation_start) = operation_start {
-            latency_sampler.record(duration_as_nanos_u64(operation_start.elapsed()));
+            let latency_ns = duration_as_nanos_u64(operation_start.elapsed());
+            if sample_overall {
+                latency_sampler.record(latency_ns);
+            }
+            if sample_kind {
+                match access.hint {
+                    AccessHint::Normal => point_latency_sampler.record(latency_ns),
+                    AccessHint::Scan => scan_latency_sampler.record(latency_ns),
+                    AccessHint::Prefetch => {
+                        unreachable!("workload never emits prefetch accesses")
+                    }
+                }
+            }
+        }
+        match access.hint {
+            AccessHint::Normal => {
+                point_operations = point_operations.saturating_add(1);
+                if source == FixSource::Dram {
+                    point_dram_hits = point_dram_hits.saturating_add(1);
+                }
+            }
+            AccessHint::Scan => {
+                scan_operations = scan_operations.saturating_add(1);
+                if source == FixSource::Dram {
+                    scan_dram_hits = scan_dram_hits.saturating_add(1);
+                }
+            }
+            AccessHint::Prefetch => unreachable!("workload never emits prefetch accesses"),
         }
         operations = operations.saturating_add(1);
     }
 
     Ok(WorkerResult {
         operations,
+        point_operations,
+        scan_operations,
+        point_dram_hits,
+        scan_dram_hits,
         latencies_ns: latency_sampler.into_values(),
+        point_latencies_ns: point_latency_sampler.into_values(),
+        scan_latencies_ns: scan_latency_sampler.into_values(),
     })
 }
 
@@ -381,7 +628,7 @@ fn fix_and_verify(
     swips: &[Swip],
     access: AccessSelection,
     prefetch_scan: bool,
-) -> Result<(), String> {
+) -> Result<FixSource, String> {
     if prefetch_scan
         && access.hint == AccessHint::Scan
         && access.index.is_multiple_of(SCAN_PREFETCH_WINDOW)
@@ -412,7 +659,7 @@ fn fix_and_verify(
                         access.index
                     ));
                 }
-                return Ok(());
+                return Ok(guard.source());
             }
             Err(TierBufError::PoolExhausted) if Instant::now() < retry_deadline => {
                 thread::sleep(RESOURCE_RETRY_PAUSE);
@@ -491,14 +738,26 @@ struct WorkerRun {
 #[derive(Debug)]
 struct WorkerResult {
     operations: u64,
+    point_operations: u64,
+    scan_operations: u64,
+    point_dram_hits: u64,
+    scan_dram_hits: u64,
     latencies_ns: Vec<u64>,
+    point_latencies_ns: Vec<u64>,
+    scan_latencies_ns: Vec<u64>,
 }
 
 #[derive(Debug)]
 struct PhaseResult {
     operations: u64,
+    point_operations: u64,
+    scan_operations: u64,
+    point_dram_hits: u64,
+    scan_dram_hits: u64,
     elapsed: Duration,
     latencies_ns: Vec<u64>,
+    point_latencies_ns: Vec<u64>,
+    scan_latencies_ns: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -666,6 +925,18 @@ struct BenchRow {
     p50_us: f64,
     p99_us: f64,
     cost_usd_per_1e6ops: f64,
+    point_ops: u64,
+    point_throughput_ops: f64,
+    point_p50_us: f64,
+    point_p99_us: f64,
+    scan_ops: u64,
+    scan_throughput_ops: f64,
+    scan_p50_us: f64,
+    scan_p99_us: f64,
+    dram_hit_rate: f64,
+    lower_tier_hit_rate: f64,
+    point_dram_hit_rate: f64,
+    scan_dram_hit_rate: f64,
 }
 
 impl BenchRow {
@@ -673,6 +944,8 @@ impl BenchRow {
         fraction: DramFraction,
         mut measured: PhaseResult,
         measured_cost_usd: f64,
+        stats_before: &TierStats,
+        stats_after: &TierStats,
     ) -> Result<Self, String> {
         if measured.operations == 0 {
             return Err(format!(
@@ -688,26 +961,158 @@ impl BenchRow {
             .ok_or_else(|| "measurement produced no latency samples".to_owned())?;
         let p99_ns = percentile(&mut measured.latencies_ns, 99)
             .ok_or_else(|| "measurement produced no latency samples".to_owned())?;
+        let (point_p50_us, point_p99_us) = operation_latency_us(
+            measured.point_operations,
+            &mut measured.point_latencies_ns,
+            "point",
+        )?;
+        let (scan_p50_us, scan_p99_us) = operation_latency_us(
+            measured.scan_operations,
+            &mut measured.scan_latencies_ns,
+            "scan",
+        )?;
+        let classified_operations = measured
+            .point_operations
+            .checked_add(measured.scan_operations)
+            .ok_or_else(|| "classified operation count overflowed u64".to_owned())?;
+        if classified_operations != measured.operations {
+            return Err(format!(
+                "operation classification mismatch: total={}, point={}, scan={}",
+                measured.operations, measured.point_operations, measured.scan_operations
+            ));
+        }
+        if measured.point_dram_hits > measured.point_operations
+            || measured.scan_dram_hits > measured.scan_operations
+        {
+            return Err("operation DRAM hit count exceeded its operation count".to_owned());
+        }
+        let (dram_hits, lower_tier_hits) = demand_hit_delta(stats_before, stats_after)?;
+        let classified_hits = dram_hits
+            .checked_add(lower_tier_hits)
+            .ok_or_else(|| "demand hit count overflowed u64".to_owned())?;
+        if classified_hits != measured.operations {
+            return Err(format!(
+                "tier hit classification mismatch: operations={}, DRAM hits={}, lower-tier hits={}",
+                measured.operations, dram_hits, lower_tier_hits
+            ));
+        }
+        let classified_dram_hits = measured
+            .point_dram_hits
+            .checked_add(measured.scan_dram_hits)
+            .ok_or_else(|| "operation DRAM hit count overflowed u64".to_owned())?;
+        if classified_dram_hits != dram_hits {
+            return Err(format!(
+                "operation DRAM hit classification mismatch: stats={dram_hits}, point={}, scan={}",
+                measured.point_dram_hits, measured.scan_dram_hits
+            ));
+        }
         let operations = measured.operations as f64;
+        let elapsed_seconds = measured.elapsed.as_secs_f64();
 
         Ok(Self {
             fraction,
-            throughput_ops: operations / measured.elapsed.as_secs_f64(),
+            throughput_ops: operations / elapsed_seconds,
             p50_us: p50_ns as f64 / 1_000.0,
             p99_us: p99_ns as f64 / 1_000.0,
             cost_usd_per_1e6ops: measured_cost_usd * 1_000_000.0 / operations,
+            point_ops: measured.point_operations,
+            point_throughput_ops: measured.point_operations as f64 / elapsed_seconds,
+            point_p50_us,
+            point_p99_us,
+            scan_ops: measured.scan_operations,
+            scan_throughput_ops: measured.scan_operations as f64 / elapsed_seconds,
+            scan_p50_us,
+            scan_p99_us,
+            dram_hit_rate: dram_hits as f64 / operations,
+            lower_tier_hit_rate: lower_tier_hits as f64 / operations,
+            point_dram_hit_rate: ratio_or_zero(measured.point_dram_hits, measured.point_operations),
+            scan_dram_hit_rate: ratio_or_zero(measured.scan_dram_hits, measured.scan_operations),
         })
     }
 }
 
+fn ratio_or_zero(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn operation_latency_us(
+    operations: u64,
+    latencies_ns: &mut [u64],
+    operation_name: &str,
+) -> Result<(f64, f64), String> {
+    if operations == 0 {
+        return Ok((0.0, 0.0));
+    }
+    let p50_ns = percentile(latencies_ns, 50)
+        .ok_or_else(|| format!("measurement produced no {operation_name} latency samples"))?;
+    let p99_ns = percentile(latencies_ns, 99)
+        .ok_or_else(|| format!("measurement produced no {operation_name} latency samples"))?;
+    Ok((p50_ns as f64 / 1_000.0, p99_ns as f64 / 1_000.0))
+}
+
+fn demand_hit_delta(before: &TierStats, after: &TierStats) -> Result<(u64, u64), String> {
+    if before.tiers.len() != after.tiers.len()
+        || before
+            .tiers
+            .iter()
+            .zip(&after.tiers)
+            .any(|(before_tier, after_tier)| before_tier.name != after_tier.name)
+    {
+        return Err("tier stats changed shape during measurement".to_owned());
+    }
+    let dram_hits = after
+        .dram_hits
+        .checked_sub(before.dram_hits)
+        .ok_or_else(|| "DRAM hit counter regressed during measurement".to_owned())?;
+    let lower_tier_hits = before.tiers.iter().zip(&after.tiers).try_fold(
+        0_u64,
+        |total, (before_tier, after_tier)| {
+            let delta = after_tier
+                .demand_hits
+                .checked_sub(before_tier.demand_hits)
+                .ok_or_else(|| {
+                    format!(
+                        "demand hit counter for tier '{}' regressed during measurement",
+                        after_tier.name
+                    )
+                })?;
+            total
+                .checked_add(delta)
+                .ok_or_else(|| "lower-tier demand hit count overflowed u64".to_owned())
+        },
+    )?;
+    Ok((dram_hits, lower_tier_hits))
+}
+
 fn format_csv_row(row: &BenchRow) -> String {
     format!(
-        "{},{:.3},{:.3},{:.3},{:.12}\n",
+        concat!(
+            "{},{:.3},{:.3},{:.3},{:.12},",
+            "{},{:.3},{:.3},{:.3},",
+            "{},{:.3},{:.3},{:.3},",
+            "{:.9},{:.9},{:.9},{:.9}\n"
+        ),
         row.fraction.label(),
         row.throughput_ops,
         row.p50_us,
         row.p99_us,
-        row.cost_usd_per_1e6ops
+        row.cost_usd_per_1e6ops,
+        row.point_ops,
+        row.point_throughput_ops,
+        row.point_p50_us,
+        row.point_p99_us,
+        row.scan_ops,
+        row.scan_throughput_ops,
+        row.scan_p50_us,
+        row.scan_p99_us,
+        row.dram_hit_rate,
+        row.lower_tier_hit_rate,
+        row.point_dram_hit_rate,
+        row.scan_dram_hit_rate
     )
 }
 
@@ -790,6 +1195,9 @@ struct Config {
     scan_only: bool,
     file_tier: Option<PathBuf>,
     output: PathBuf,
+    stats_output: PathBuf,
+    fractions: Vec<DramFraction>,
+    eviction_mode: EvictionMode,
 }
 
 impl Default for Config {
@@ -804,6 +1212,9 @@ impl Default for Config {
             scan_only: false,
             file_tier: None,
             output: PathBuf::from(DEFAULT_OUTPUT),
+            stats_output: PathBuf::from(DEFAULT_STATS_OUTPUT),
+            fractions: DRAM_FRACTIONS.to_vec(),
+            eviction_mode: EvictionMode::Demand,
         }
     }
 }
@@ -865,6 +1276,12 @@ impl Config {
         if self.output.as_os_str().is_empty() {
             return Err("--output must not be empty".to_owned());
         }
+        if self.stats_output.as_os_str().is_empty() {
+            return Err("--stats-output must not be empty".to_owned());
+        }
+        if self.fractions.is_empty() {
+            return Err("at least one DRAM fraction must be selected".to_owned());
+        }
         if self
             .file_tier
             .as_ref()
@@ -904,6 +1321,9 @@ where
     let mut scan_only = false;
     let mut file_tier = None;
     let mut output = None;
+    let mut stats_output = None;
+    let mut fraction = None;
+    let mut eviction_mode = None;
 
     while let Some(argument) = arguments.next() {
         if argument == "-h" || argument == "--help" {
@@ -959,6 +1379,18 @@ where
             "--output" => {
                 output = Some(PathBuf::from(next_value()?));
             }
+            "--stats-output" => {
+                stats_output = Some(PathBuf::from(next_value()?));
+            }
+            "--fraction" => {
+                if fraction.is_some() {
+                    return Err("--fraction may be specified only once".to_owned());
+                }
+                fraction = Some(parse_fraction(&next_value()?, flag)?);
+            }
+            "--eviction-mode" => {
+                eviction_mode = Some(parse_eviction_mode(&next_value()?, flag)?);
+            }
             _ => {
                 return Err(format!(
                     "unknown argument '{argument}'; use --help for usage"
@@ -995,8 +1427,37 @@ where
     if let Some(value) = output {
         config.output = value;
     }
+    if let Some(value) = stats_output {
+        config.stats_output = value;
+    }
+    if let Some(value) = fraction {
+        config.fractions = vec![value];
+    }
+    if let Some(value) = eviction_mode {
+        config.eviction_mode = value;
+    }
     config.validate()?;
     Ok(CliAction::Run(config))
+}
+
+fn parse_fraction(value: &str, flag: &str) -> Result<DramFraction, String> {
+    DRAM_FRACTIONS
+        .iter()
+        .copied()
+        .find(|fraction| fraction.label() == value)
+        .ok_or_else(|| {
+            format!("{flag} expects one of 1.0, 0.8, 0.6, 0.4, 0.2, or 0.1; got '{value}'")
+        })
+}
+
+fn parse_eviction_mode(value: &str, flag: &str) -> Result<EvictionMode, String> {
+    match value {
+        "demand" => Ok(EvictionMode::Demand),
+        "watermark" => Ok(EvictionMode::Watermark),
+        _ => Err(format!(
+            "{flag} expects 'demand' or 'watermark'; got '{value}'"
+        )),
+    }
 }
 
 fn set_profile(selected: &mut Option<Profile>, requested: Profile) -> Result<(), String> {
@@ -1053,6 +1514,9 @@ Options:
     --scan-only             Run the sequential scan component only
     --file-tier PATH        Use one reusable FileTier path instead of MockTier
     --output PATH           CSV output path, replaced each run (default: results/curve.csv)
+    --stats-output PATH     JSON stats output path (default: results/stats.json)
+    --fraction FRACTION     Run one DRAM fraction: 1.0, 0.8, 0.6, 0.4, 0.2, or 0.1
+    --eviction-mode MODE    Background eviction mode: demand (default) or watermark
     -h, --help              Show this help
 
 Explicit sizing and duration options override the selected profile."
@@ -1065,11 +1529,14 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use tierbuf::PAGE_SIZE;
+    use tierbuf::metrics::{TierCounters, TierStats};
     use tierbuf::policy::AccessHint;
 
     use super::{
-        BenchRow, CSV_HEADER, CliAction, Config, CsvOutput, DramFraction, POINT_ACCESS_PERCENT,
-        WorkloadState, ZipfSampler, format_csv_row, parse_cli, percentile,
+        BenchRow, CSV_HEADER, CliAction, Config, CsvOutput, DramFraction, EvictionMode,
+        POINT_ACCESS_PERCENT, PhaseResult, WorkloadState, ZipfSampler, format_csv_row, parse_cli,
+        percentile,
     };
 
     fn run_config(arguments: &[&str]) -> Config {
@@ -1113,6 +1580,12 @@ mod tests {
             "/tmp/tierbuf-bench-test.bin",
             "--output",
             "custom.csv",
+            "--stats-output",
+            "custom.json",
+            "--fraction",
+            "0.6",
+            "--eviction-mode",
+            "watermark",
         ]);
         assert_eq!(config.dataset_mib, 64);
         assert_eq!(config.warmup, Duration::from_millis(250));
@@ -1126,6 +1599,9 @@ mod tests {
             Some(PathBuf::from("/tmp/tierbuf-bench-test.bin"))
         );
         assert_eq!(config.output, PathBuf::from("custom.csv"));
+        assert_eq!(config.stats_output, PathBuf::from("custom.json"));
+        assert_eq!(config.fractions, vec![DramFraction::new(6)]);
+        assert_eq!(config.eviction_mode, EvictionMode::Watermark);
 
         for invalid in [
             vec!["--quick", "--ci"],
@@ -1135,6 +1611,9 @@ mod tests {
             vec!["--workers", "0"],
             vec!["--file-tier="],
             vec!["--output="],
+            vec!["--stats-output="],
+            vec!["--fraction", "0.5"],
+            vec!["--eviction-mode", "periodic"],
             vec!["--unknown"],
             vec!["--workers"],
         ] {
@@ -1156,6 +1635,18 @@ mod tests {
             p50_us: 3.0,
             p99_us: 4.0,
             cost_usd_per_1e6ops: 5.0,
+            point_ops: 8,
+            point_throughput_ops: 8.0,
+            point_p50_us: 2.0,
+            point_p99_us: 3.0,
+            scan_ops: 4,
+            scan_throughput_ops: 4.0,
+            scan_p50_us: 4.0,
+            scan_p99_us: 5.0,
+            dram_hit_rate: 0.75,
+            lower_tier_hit_rate: 0.25,
+            point_dram_hit_rate: 0.875,
+            scan_dram_hit_rate: 0.5,
         };
         let mut output = CsvOutput::open(&path).expect("replace output");
         output.append(&row).expect("write row");
@@ -1203,6 +1694,36 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_row_separates_operation_types_and_demand_hit_tiers() {
+        let before = test_stats(10, 5);
+        let after = test_stats(16, 9);
+        let measured = PhaseResult {
+            operations: 10,
+            point_operations: 7,
+            scan_operations: 3,
+            point_dram_hits: 5,
+            scan_dram_hits: 1,
+            elapsed: Duration::from_secs(2),
+            latencies_ns: vec![1_000, 2_000, 3_000],
+            point_latencies_ns: vec![1_000, 2_000],
+            scan_latencies_ns: vec![4_000, 5_000],
+        };
+
+        let row =
+            BenchRow::from_measurement(DramFraction::new(8), measured, 0.000_001, &before, &after)
+                .expect("consistent measurement");
+
+        assert_eq!(row.point_ops, 7);
+        assert_eq!(row.scan_ops, 3);
+        assert_eq!(row.point_throughput_ops, 3.5);
+        assert_eq!(row.scan_throughput_ops, 1.5);
+        assert_eq!(row.dram_hit_rate, 0.6);
+        assert_eq!(row.lower_tier_hit_rate, 0.4);
+        assert_eq!(row.point_dram_hit_rate, 5.0 / 7.0);
+        assert_eq!(row.scan_dram_hit_rate, 1.0 / 3.0);
+    }
+
+    #[test]
     fn csv_row_format_is_stable_and_valid() {
         let row = BenchRow {
             fraction: DramFraction::new(8),
@@ -1210,11 +1731,49 @@ mod tests {
             p50_us: 4.25,
             p99_us: 99.75,
             cost_usd_per_1e6ops: 0.000_012_345,
+            point_ops: 700,
+            point_throughput_ops: 864.15,
+            point_p50_us: 1.25,
+            point_p99_us: 12.5,
+            scan_ops: 300,
+            scan_throughput_ops: 370.35,
+            scan_p50_us: 8.75,
+            scan_p99_us: 150.25,
+            dram_hit_rate: 0.8,
+            lower_tier_hit_rate: 0.2,
+            point_dram_hit_rate: 0.9,
+            scan_dram_hit_rate: 0.566_666_667,
         };
 
         assert_eq!(
             format_csv_row(&row),
-            "0.8,1234.500,4.250,99.750,0.000012345000\n"
+            concat!(
+                "0.8,1234.500,4.250,99.750,0.000012345000,",
+                "700,864.150,1.250,12.500,",
+                "300,370.350,8.750,150.250,",
+                "0.800000000,0.200000000,0.900000000,0.566666667\n"
+            )
         );
+    }
+
+    fn test_stats(dram_hits: u64, lower_tier_hits: u64) -> TierStats {
+        TierStats {
+            dram_hits,
+            faults: lower_tier_hits,
+            evictions: 0,
+            second_chances: 0,
+            prefetch_submitted: 0,
+            prefetch_hits: 0,
+            prefetch_skipped: 0,
+            budget_denied: 0,
+            tiers: vec![TierCounters {
+                name: "mock".to_owned(),
+                demand_hits: lower_tier_hits,
+                reads: lower_tier_hits,
+                writes: 0,
+                bytes_read: lower_tier_hits * PAGE_SIZE as u64,
+                bytes_written: 0,
+            }],
+        }
     }
 }

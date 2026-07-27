@@ -56,6 +56,20 @@ class BenchmarkVisualizationTests(unittest.TestCase):
             self.assertIn("wrote", result.stdout)
             self.assertIn("tierbuf benchmark dashboard", output.read_text(encoding="utf-8"))
 
+    def test_extended_csv_renders_operation_and_tier_hit_charts(self) -> None:
+        runs = visualize_bench.load_runs(
+            [FIXTURES / "extended.csv"], ["extended run"]
+        )
+
+        report = visualize_bench.render_report(runs)
+
+        self.assertIn("Operation throughput by type", report)
+        self.assertIn("Demand hit rate by tier", report)
+        self.assertIn("DRAM hit rate by operation type", report)
+        self.assertIn('"dramHitRate":0.95', report)
+        self.assertIn('"pointThroughput":700.0', report)
+        self.assertIn('"pointDramHitRate":0.98', report)
+
     def test_label_count_must_match_csv_count(self) -> None:
         with self.assertRaisesRegex(Exception, "--labels expected 2 value"):
             visualize_bench.load_runs(

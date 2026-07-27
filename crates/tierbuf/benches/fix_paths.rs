@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use tierbuf::PAGE_SIZE;
-use tierbuf::pool::{BufConfig, BufferManager, Economics};
+use tierbuf::pool::{BufConfig, BufferManager, Economics, EvictionMode};
 use tierbuf::tier::TierBackend;
 use tierbuf::tier::mock::MockTier;
 
@@ -11,6 +11,7 @@ fn hot_fix_paths(criterion: &mut Criterion) {
     let manager = BufferManager::new(BufConfig {
         dram_pool_bytes: PAGE_SIZE * 4,
         cooling_ratio: 0.1,
+        eviction_mode: EvictionMode::Demand,
         economics: Economics::default(),
         tiers: vec![Box::new(tier) as Box<dyn TierBackend>],
     })

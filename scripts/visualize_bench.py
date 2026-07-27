@@ -124,6 +124,18 @@ def render_report(
                     "p50": point.p50_us,
                     "p99": point.p99_us,
                     "cost": point.cost_usd_per_1e6ops,
+                    "pointOps": point.point_ops,
+                    "pointThroughput": point.point_throughput_ops,
+                    "pointP50": point.point_p50_us,
+                    "pointP99": point.point_p99_us,
+                    "scanOps": point.scan_ops,
+                    "scanThroughput": point.scan_throughput_ops,
+                    "scanP50": point.scan_p50_us,
+                    "scanP99": point.scan_p99_us,
+                    "dramHitRate": point.dram_hit_rate,
+                    "lowerTierHitRate": point.lower_tier_hit_rate,
+                    "pointDramHitRate": point.point_dram_hit_rate,
+                    "scanDramHitRate": point.scan_dram_hit_rate,
                 }
                 for point in run.points
             ],
@@ -146,14 +158,47 @@ def render_report(
         </svg>
       </section>"""
 
+    has_extended_metrics = all(
+        point.has_extended_metrics for run in runs for point in run.points
+    )
+    extended_sections = ""
+    if has_extended_metrics:
+        extended_sections = """
+      <section>
+        <h2>Operation throughput by type</h2>
+        <p>Solid lines are point operations; dashed lines are scan operations.</p>
+        <svg id="operation-chart" viewBox="0 0 680 330" role="img" aria-labelledby="operation-title operation-desc">
+          <title id="operation-title">Point and scan throughput by DRAM resident fraction</title>
+          <desc id="operation-desc">Separates completed operation throughput into point and scan traffic for every run.</desc>
+        </svg>
+      </section>
+      <section>
+        <h2>Demand hit rate by tier</h2>
+        <p>Solid lines are DRAM hits; dashed lines are lower-tier demand restores. Prefetch I/O is excluded.</p>
+        <svg id="hit-rate-chart" viewBox="0 0 680 330" role="img" aria-labelledby="hit-rate-title hit-rate-desc">
+          <title id="hit-rate-title">DRAM and lower-tier demand hit rates</title>
+          <desc id="hit-rate-desc">Shows the share of completed demand fixes served from DRAM and restored from a lower tier.</desc>
+        </svg>
+      </section>
+      <section>
+        <h2>DRAM hit rate by operation type</h2>
+        <p>Solid lines are point operations; dashed lines are scan operations.</p>
+        <svg id="operation-hit-rate-chart" viewBox="0 0 680 330" role="img" aria-labelledby="operation-hit-rate-title operation-hit-rate-desc">
+          <title id="operation-hit-rate-title">Point and scan DRAM hit rates</title>
+          <desc id="operation-hit-rate-desc">Separates DRAM hit rates for point and scan operations at every resident fraction.</desc>
+        </svg>
+      </section>"""
+
     return HTML_TEMPLATE.substitute(
         runs_json=json.dumps(run_payload, separators=(",", ":")),
         hotpath_json=json.dumps(hotpath_payload, separators=(",", ":")),
+        has_extended_metrics_json=json.dumps(has_extended_metrics),
         dram_price=f"{dram_price:.2f}",
         lower_price=f"{lower_price:.2f}",
         throughput_limit=degradation.THROUGHPUT_RATIO_LIMIT,
         p99_limit=degradation.P99_RATIO_LIMIT,
         hotpath_section=hotpath_section,
+        extended_sections=extended_sections,
     )
 
 
@@ -357,6 +402,7 @@ HTML_TEMPLATE = Template(
           <desc id="savings-desc">Shows estimated capacity-cost saving relative to an all-DRAM pool.</desc>
         </svg>
       </section>
+$extended_sections
 $hotpath_section
       <section class="wide">
         <h2>Summary by DRAM resident fraction</h2>
@@ -380,6 +426,7 @@ $hotpath_section
     (function () {
       const runs = $runs_json;
       const hotPath = $hotpath_json;
+      const hasExtendedMetrics = $has_extended_metrics_json;
       const dramPrice = Number("$dram_price");
       const lowerPrice = Number("$lower_price");
       const throughputLimit = Number("$throughput_limit");
@@ -422,6 +469,18 @@ $hotpath_section
             p50: item.p50,
             p99: item.p99,
             cost: item.cost,
+            pointOps: item.pointOps,
+            pointThroughput: item.pointThroughput,
+            pointP50: item.pointP50,
+            pointP99: item.pointP99,
+            scanOps: item.scanOps,
+            scanThroughput: item.scanThroughput,
+            scanP50: item.scanP50,
+            scanP99: item.scanP99,
+            dramHitRate: item.dramHitRate,
+            lowerTierHitRate: item.lowerTierHitRate,
+            pointDramHitRate: item.pointDramHitRate,
+            scanDramHitRate: item.scanDramHitRate,
             retention: item.throughput / base.throughput * 100,
             p99Multiplier: item.p99 / base.p99,
             unitCostMultiplier: item.cost / base.cost
@@ -583,6 +642,63 @@ $hotpath_section
         });
       }
 
+      function drawPairedMetricChart(svgId, options) {
+        const svg = document.getElementById(svgId);
+        if (!svg || !hasExtendedMetrics) {
+          return;
+        }
+        const width = 680;
+        const height = 330;
+        const left = 72;
+        const right = 22;
+        const top = 24;
+        const bottom = 58;
+        const x = scaleLinear([1.0, Math.min.apply(null, fractions)], [left, width - right]);
+        const y = scaleLinear(options.domain, [height - bottom, top]);
+        const cfg = { left, right, top, bottom, width, height, x, y };
+        addAxes(svg, cfg, options.ticks, options.format);
+
+        enrichedRuns.forEach((run) => {
+          options.metrics.forEach((metric, metricIndex) => {
+            const points = run.values.map((item) => ({
+              fraction: item.fraction,
+              value: metric.value(item),
+              raw: item
+            }));
+            const path = makeSvg("path", {
+              class: "line",
+              d: pathFor(points, x, y),
+              stroke: run.color
+            });
+            if (metricIndex === 1) {
+              path.setAttribute("stroke-dasharray", "9 7");
+            }
+            svg.appendChild(path);
+            points.forEach((point) => {
+              const circle = makeSvg("circle", {
+                class: "point",
+                cx: x(point.fraction),
+                cy: y(point.value),
+                r: metricIndex === 0 ? 4.5 : 3.5,
+                fill: metricIndex === 0 ? run.color : "var(--card)",
+                stroke: run.color,
+                "stroke-width": 2
+              });
+              const lines = [
+                run.name + " · DRAM " + Math.round(point.fraction * 100) + "%",
+                metric.label + ": " + options.tooltipFormat(point.value),
+                "point p99: " + point.raw.pointP99.toFixed(3) + " us",
+                "scan p99: " + point.raw.scanP99.toFixed(3) + " us"
+              ];
+              circle.addEventListener("mouseenter", (evt) => showTooltip(evt, lines));
+              circle.addEventListener("mousemove", (evt) => showTooltip(evt, lines));
+              circle.addEventListener("mouseleave", hideTooltip);
+              svg.appendChild(circle);
+            });
+          });
+        });
+      }
+
       function drawHotpathChart() {
         const svg = document.getElementById("hotpath-chart");
         if (!svg || hotPath.length === 0) {
@@ -647,6 +763,15 @@ $hotpath_section
         target.appendChild(swatch);
         target.appendChild(document.createTextNode("Median / target"));
         legend.appendChild(target);
+        if (hasExtendedMetrics) {
+          const metricStyles = document.createElement("span");
+          metricStyles.appendChild(
+            document.createTextNode(
+              "Solid: point / DRAM · Dashed: scan / lower tier"
+            )
+          );
+          legend.appendChild(metricStyles);
+        }
       }
 
       function fillSummaryTable() {
@@ -696,6 +821,48 @@ $hotpath_section
         band: "p99Values"
       });
       drawSavingsChart();
+      if (hasExtendedMetrics) {
+        const maxOperationThroughput = Math.max.apply(
+          null,
+          enrichedRuns.flatMap((run) =>
+            run.values.flatMap((item) => [
+              item.pointThroughput,
+              item.scanThroughput
+            ])
+          )
+        );
+        const operationDomainMax = Math.max(1, maxOperationThroughput * 1.08);
+        drawPairedMetricChart("operation-chart", {
+          domain: [0, operationDomainMax],
+          ticks: [0, operationDomainMax * 0.25, operationDomainMax * 0.5, operationDomainMax * 0.75, operationDomainMax],
+          format: (tick) => Math.round(tick).toLocaleString(),
+          tooltipFormat: (value) => Math.round(value).toLocaleString() + " ops/s",
+          metrics: [
+            { label: "point throughput", value: (item) => item.pointThroughput },
+            { label: "scan throughput", value: (item) => item.scanThroughput }
+          ]
+        });
+        drawPairedMetricChart("hit-rate-chart", {
+          domain: [0, 100],
+          ticks: [0, 25, 50, 75, 100],
+          format: (tick) => pct(tick),
+          tooltipFormat: (value) => pct(value, 1),
+          metrics: [
+            { label: "DRAM hit rate", value: (item) => item.dramHitRate * 100 },
+            { label: "lower-tier hit rate", value: (item) => item.lowerTierHitRate * 100 }
+          ]
+        });
+        drawPairedMetricChart("operation-hit-rate-chart", {
+          domain: [0, 100],
+          ticks: [0, 25, 50, 75, 100],
+          format: (tick) => pct(tick),
+          tooltipFormat: (value) => pct(value, 1),
+          metrics: [
+            { label: "point DRAM hit rate", value: (item) => item.pointDramHitRate * 100 },
+            { label: "scan DRAM hit rate", value: (item) => item.scanDramHitRate * 100 }
+          ]
+        });
+      }
       drawHotpathChart();
       fillSummaryTable();
     })();

@@ -8,7 +8,9 @@ use proptest::collection;
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 
-use tierbuf::pool::{BufConfig, BufferManager, Economics, ExclusiveGuard, SharedGuard};
+use tierbuf::pool::{
+    BufConfig, BufferManager, Economics, EvictionMode, ExclusiveGuard, SharedGuard,
+};
 use tierbuf::swip::{Swip, SwipState};
 use tierbuf::tier::TierBackend;
 use tierbuf::tier::mock::MockTier;
@@ -154,6 +156,7 @@ fn test_manager() -> Arc<BufferManager> {
     BufferManager::new(BufConfig {
         dram_pool_bytes: FRAME_COUNT * PAGE_SIZE,
         cooling_ratio: 0.34,
+        eviction_mode: EvictionMode::Demand,
         economics: Economics {
             dram_price_gb_month: 4.5,
             epoch: Duration::from_micros(50),

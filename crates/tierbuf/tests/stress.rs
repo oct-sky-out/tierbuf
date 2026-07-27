@@ -5,7 +5,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tierbuf::pool::{BufConfig, BufferManager, Economics};
+use tierbuf::pool::{BufConfig, BufferManager, Economics, EvictionMode};
 use tierbuf::swip::Swip;
 use tierbuf::tier::TierBackend;
 use tierbuf::tier::mock::MockTier;
@@ -26,6 +26,7 @@ fn five_minute_randomized_pressure() {
     let manager = BufferManager::new(BufConfig {
         dram_pool_bytes: frame_count * PAGE_SIZE,
         cooling_ratio: 0.1,
+        eviction_mode: EvictionMode::Demand,
         economics: Economics {
             dram_price_gb_month: 4.5,
             epoch: Duration::from_millis(25),

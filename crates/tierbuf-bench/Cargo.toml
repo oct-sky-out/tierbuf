@@ -8,4 +8,5 @@ publish = false
 description = "Benchmark harness for tierbuf degradation curves"
 
 [dependencies]
+serde_json.workspace = true
 tierbuf.workspace = true

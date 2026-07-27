@@ -59,10 +59,33 @@ pub struct BufConfig {
     pub dram_pool_bytes: usize,
     /// Fraction of DRAM frames eventually reserved for the cooling stage.
     pub cooling_ratio: f64,
+    /// Condition used by the background cooler.
+    pub eviction_mode: EvictionMode,
     /// Economic policy inputs.
     pub economics: Economics,
     /// Lower storage tiers, ordered from fastest to the authoritative tier.
     pub tiers: Vec<Box<dyn TierBackend>>,
+}
+
+/// Background-eviction activation policy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EvictionMode {
+    /// Evict below the low watermark only after a demand fault-in in the
+    /// current economic epoch.
+    #[default]
+    Demand,
+    /// Preserve the original behavior of maintaining the low watermark
+    /// regardless of recent demand.
+    Watermark,
+}
+
+/// Storage source that satisfied one completed fix.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FixSource {
+    /// The page was already resident in DRAM.
+    Dram,
+    /// The page was restored from a configured lower tier.
+    LowerTier,
 }
 
 /// A page's backing location below DRAM.
@@ -170,7 +193,7 @@ struct CompletedFault {
 
 #[derive(Clone, Debug)]
 enum FaultOutcome {
-    Success,
+    Success(Option<usize>),
     Failure(ReplayableFaultError),
 }
 
@@ -194,7 +217,7 @@ enum ReplayableFaultError {
 
 enum FaultTurn<'a> {
     Leader(FaultLeader<'a>),
-    Follower(Result<()>),
+    Follower(Result<Option<usize>>),
 }
 
 struct FaultLeader<'a> {
@@ -290,16 +313,16 @@ impl FaultCoordinator {
 }
 
 impl FaultOutcome {
-    fn from_result<T>(result: &Result<T>) -> Self {
+    fn from_result(result: &Result<Option<usize>>) -> Self {
         match result {
-            Ok(_) => Self::Success,
+            Ok(tier_index) => Self::Success(*tier_index),
             Err(error) => Self::Failure(ReplayableFaultError::from(error)),
         }
     }
 
-    fn into_result(self) -> Result<()> {
+    fn into_result(self) -> Result<Option<usize>> {
         match self {
-            Self::Success => Ok(()),
+            Self::Success(tier_index) => Ok(tier_index),
             Self::Failure(error) => Err(error.into()),
         }
     }
@@ -341,7 +364,7 @@ impl From<ReplayableFaultError> for TierBufError {
 }
 
 impl FaultLeader<'_> {
-    fn finish<T>(mut self, result: &Result<T>) {
+    fn finish(mut self, result: &Result<Option<usize>>) {
         self.active = false;
         self.coordinator
             .complete(self.generation, FaultOutcome::from_result(result));
@@ -361,8 +384,19 @@ impl Drop for FaultLeader<'_> {
 
 #[derive(Debug, Default)]
 struct WorkerSignal {
-    wait: Mutex<()>,
+    generation: Mutex<u64>,
     wakeup: Condvar,
+}
+
+impl WorkerSignal {
+    fn notify(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.wrapping_add(1);
+        self.wakeup.notify_all();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,10 +464,14 @@ pub struct BufferManager {
     cooling: CoolingQueue,
     cooling_target: usize,
     low_watermark: usize,
+    eviction_mode: EvictionMode,
+    fault_ins_this_epoch: AtomicU64,
+    exhausted_frame_request: AtomicBool,
     sample_cursor: AtomicU64,
     stopping: Arc<AtomicBool>,
     epoch: Duration,
     worker_signal: Arc<WorkerSignal>,
+    cooler_signal: Arc<WorkerSignal>,
     workers: Mutex<Vec<JoinHandle<()>>>,
     prefetch_sender: SyncSender<PrefetchTask>,
     prefetch_receiver: Arc<Mutex<Receiver<PrefetchTask>>>,
@@ -504,10 +542,14 @@ impl BufferManager {
             cooling: CoolingQueue::default(),
             cooling_target,
             low_watermark,
+            eviction_mode: config.eviction_mode,
+            fault_ins_this_epoch: AtomicU64::new(0),
+            exhausted_frame_request: AtomicBool::new(false),
             sample_cursor: AtomicU64::new(0),
             stopping: Arc::new(AtomicBool::new(false)),
             epoch,
             worker_signal: Arc::new(WorkerSignal::default()),
+            cooler_signal: Arc::new(WorkerSignal::default()),
             workers: Mutex::new(Vec::with_capacity(2 + PREFETCH_WORKERS)),
             prefetch_sender,
             prefetch_receiver: Arc::new(Mutex::new(prefetch_receiver)),
@@ -620,6 +662,7 @@ impl BufferManager {
         self.ensure_running()?;
         let pid = self.validate_handle(swip)?;
         let mut faulted = false;
+        let mut faulted_tier = None;
         loop {
             self.ensure_running()?;
             match swip.load() {
@@ -646,6 +689,11 @@ impl BufferManager {
                             self.stats.record_prefetch_hit();
                         }
                         if faulted {
+                            if let Some(tier_index) = faulted_tier {
+                                self.stats.record_tier_demand_hit(tier_index);
+                            } else {
+                                self.stats.record_dram_hit();
+                            }
                             if !self.policy.admit_to_dram(pid, hint)
                                 && swip.try_mark_cooling(resident).is_ok()
                             {
@@ -659,6 +707,11 @@ impl BufferManager {
                             index,
                             pid,
                             swip: swip.clone(),
+                            source: if faulted_tier.is_some() {
+                                FixSource::LowerTier
+                            } else {
+                                FixSource::Dram
+                            },
                             latch,
                         });
                     }
@@ -675,7 +728,9 @@ impl BufferManager {
                         self.stats.record_fault();
                         faulted = true;
                     }
-                    self.fault(swip, pid)?;
+                    if let Some(tier_index) = self.fault(swip, pid)? {
+                        faulted_tier.get_or_insert(tier_index);
+                    }
                 }
             }
         }
@@ -698,6 +753,7 @@ impl BufferManager {
         self.ensure_running()?;
         let pid = self.validate_handle(swip)?;
         let mut faulted = false;
+        let mut faulted_tier = None;
         loop {
             self.ensure_running()?;
             match swip.load() {
@@ -717,7 +773,13 @@ impl BufferManager {
                             self.stats.record_second_chance();
                         }
                         self.policy.on_access(frame, AccessKind::Write);
-                        if !faulted {
+                        if faulted {
+                            if let Some(tier_index) = faulted_tier {
+                                self.stats.record_tier_demand_hit(tier_index);
+                            } else {
+                                self.stats.record_dram_hit();
+                            }
+                        } else {
                             if self.consume_prefetched(pid, resident, frame.generation()) {
                                 self.stats.record_prefetch_hit();
                             }
@@ -744,7 +806,9 @@ impl BufferManager {
                         self.stats.record_fault();
                         faulted = true;
                     }
-                    self.fault(swip, pid)?;
+                    if let Some(tier_index) = self.fault(swip, pid)? {
+                        faulted_tier.get_or_insert(tier_index);
+                    }
                 }
             }
         }
@@ -901,7 +965,8 @@ impl BufferManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.stopping.store(true, Ordering::Release);
-        self.worker_signal.wakeup.notify_all();
+        self.worker_signal.notify();
+        self.cooler_signal.notify();
         let _operations = self
             .operation_gate
             .write()
@@ -922,6 +987,7 @@ impl BufferManager {
     /// Advances policy time, write budgets, and residency-cost integration.
     #[allow(dead_code)] // Called by the epoch thread in the cooling phase.
     pub(crate) fn tick_epoch(&self, elapsed: Duration) {
+        self.fault_ins_this_epoch.store(0, Ordering::Release);
         self.policy.on_epoch();
         for tier in &self.tiers {
             if let Some(budget) = tier.write_budget() {
@@ -953,10 +1019,11 @@ impl BufferManager {
     fn start_workers(manager: &Arc<Self>) {
         let cooler_manager = Arc::downgrade(manager);
         let cooler_stopping = Arc::clone(&manager.stopping);
-        let cooler_signal = Arc::clone(&manager.worker_signal);
+        let cooler_signal = Arc::clone(&manager.cooler_signal);
         let cooler = thread::Builder::new()
             .name("tierbuf-cooler".into())
             .spawn(move || {
+                let mut observed_signal = 0;
                 loop {
                     let Some(manager) = cooler_manager.upgrade() else {
                         break;
@@ -967,7 +1034,12 @@ impl BufferManager {
                     manager.background_cooling_step();
                     drop(manager);
 
-                    if wait_for_worker(&cooler_signal, &cooler_stopping, COOLER_INTERVAL) {
+                    if wait_for_worker(
+                        &cooler_signal,
+                        &cooler_stopping,
+                        COOLER_INTERVAL,
+                        &mut observed_signal,
+                    ) {
                         break;
                     }
                 }
@@ -981,8 +1053,10 @@ impl BufferManager {
         let epoch_worker = thread::Builder::new()
             .name("tierbuf-epoch".into())
             .spawn(move || {
+                let mut observed_signal = 0;
                 loop {
-                    if wait_for_worker(&epoch_signal, &epoch_stopping, epoch) {
+                    if wait_for_worker(&epoch_signal, &epoch_stopping, epoch, &mut observed_signal)
+                    {
                         break;
                     }
                     let Some(manager) = epoch_manager.upgrade() else {
@@ -1099,6 +1173,8 @@ impl BufferManager {
         if let Some(index) = self.frames.pop_free() {
             return Ok(FreeFrame::from_index(&self.frames, index));
         }
+        self.exhausted_frame_request.store(true, Ordering::Release);
+        self.cooler_signal.notify();
 
         let windows = self.frames.frame_count().div_ceil(MAX_COOLING_SAMPLE);
         let mut last_error = None;
@@ -1215,6 +1291,13 @@ impl BufferManager {
         if self.stopping.load(Ordering::Acquire)
             || self.frames.free_count() >= self.low_watermark
             || self.cooling_target == 0
+        {
+            return;
+        }
+        let exhausted_request = self.exhausted_frame_request.swap(false, Ordering::AcqRel);
+        if self.eviction_mode == EvictionMode::Demand
+            && self.fault_ins_this_epoch.load(Ordering::Acquire) == 0
+            && !exhausted_request
         {
             return;
         }
@@ -1509,18 +1592,18 @@ impl BufferManager {
         }
 
         let leader = match control.fault.enter() {
-            FaultTurn::Follower(result) => return result.map(|()| false),
+            FaultTurn::Follower(result) => return result.map(|_| false),
             FaultTurn::Leader(leader) => leader,
         };
         let result = self.perform_prefetch_fault(task);
         leader.finish(&result);
-        result
+        result.map(|tier_index| tier_index.is_some())
     }
 
-    fn perform_prefetch_fault(&self, task: &mut PrefetchTask) -> Result<bool> {
+    fn perform_prefetch_fault(&self, task: &mut PrefetchTask) -> Result<Option<usize>> {
         self.ensure_running()?;
         match task.swip.load() {
-            SwipState::Hot(_) | SwipState::Cooling(_) => return Ok(false),
+            SwipState::Hot(_) | SwipState::Cooling(_) => return Ok(None),
             SwipState::Evicted(observed) if observed == task.pid => {}
             SwipState::Evicted(observed) => {
                 return Err(TierBufError::InvalidPid(observed.get()));
@@ -1581,10 +1664,10 @@ impl BufferManager {
 
         checkout.commit();
         frame.unpin();
-        Ok(true)
+        Ok(Some(location.tier_index))
     }
 
-    fn fault(&self, swip: &Swip, pid: PageId) -> Result<()> {
+    fn fault(&self, swip: &Swip, pid: PageId) -> Result<Option<usize>> {
         self.ensure_running()?;
         let control = self
             .pages
@@ -1606,10 +1689,10 @@ impl BufferManager {
         result
     }
 
-    fn perform_demand_fault(&self, swip: &Swip, pid: PageId) -> Result<()> {
+    fn perform_demand_fault(&self, swip: &Swip, pid: PageId) -> Result<Option<usize>> {
         self.ensure_running()?;
         match swip.load() {
-            SwipState::Hot(_) | SwipState::Cooling(_) => return Ok(()),
+            SwipState::Hot(_) | SwipState::Cooling(_) => return Ok(None),
             SwipState::Evicted(observed) if observed == pid => {}
             SwipState::Evicted(observed) => {
                 return Err(TierBufError::InvalidPid(observed.get()));
@@ -1626,6 +1709,9 @@ impl BufferManager {
                 location.tier_index
             ))
         })?;
+        if self.eviction_mode == EvictionMode::Demand {
+            self.fault_ins_this_epoch.fetch_add(1, Ordering::Release);
+        }
         let mut checkout = self.acquire_frame()?;
         let index = checkout.index;
 
@@ -1646,7 +1732,7 @@ impl BufferManager {
 
         checkout.commit();
         frame.unpin();
-        Ok(())
+        Ok(Some(location.tier_index))
     }
 
     fn read_backing_page(
@@ -1718,7 +1804,8 @@ impl BufferManager {
 impl Drop for BufferManager {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        self.worker_signal.wakeup.notify_all();
+        self.worker_signal.notify();
+        self.cooler_signal.notify();
         let pages = self
             .pages
             .get_mut()
@@ -1805,6 +1892,7 @@ pub struct SharedGuard<'a> {
     index: usize,
     pid: PageId,
     swip: Swip,
+    source: FixSource,
     latch: SharedRaw<'a>,
 }
 
@@ -1819,6 +1907,12 @@ impl SharedGuard<'_> {
     #[must_use]
     pub fn swip(&self) -> Swip {
         self.swip.clone()
+    }
+
+    /// Returns whether this fix was served from DRAM or a lower tier.
+    #[must_use]
+    pub const fn source(&self) -> FixSource {
+        self.source
     }
 
     /// Runs `read` with an immutable view of the complete fixed-size page.
@@ -2031,21 +2125,33 @@ fn receive_prefetch_task(
     }
 }
 
-fn wait_for_worker(signal: &WorkerSignal, stopping: &AtomicBool, timeout: Duration) -> bool {
+fn wait_for_worker(
+    signal: &WorkerSignal,
+    stopping: &AtomicBool,
+    timeout: Duration,
+    observed_generation: &mut u64,
+) -> bool {
     if stopping.load(Ordering::Acquire) {
         return true;
     }
     let guard = signal
-        .wait
+        .generation
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if stopping.load(Ordering::Acquire) {
         return true;
     }
+    if *guard != *observed_generation {
+        *observed_generation = *guard;
+        return false;
+    }
     let _waited = signal
         .wakeup
-        .wait_timeout_while(guard, timeout, |_| !stopping.load(Ordering::Acquire))
+        .wait_timeout_while(guard, timeout, |generation| {
+            !stopping.load(Ordering::Acquire) && *generation == *observed_generation
+        })
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *observed_generation = *_waited.0;
     stopping.load(Ordering::Acquire)
 }
 
@@ -2105,8 +2211,8 @@ mod tests {
     use crate::{PAGE_SIZE, TierBufError};
 
     use super::{
-        BufConfig, BufferManager, CoolingTicket, Economics, EvictionOutcome, FreeFrame,
-        MAX_PREFETCH_IN_FLIGHT,
+        BufConfig, BufferManager, CoolingTicket, Economics, EvictionMode, EvictionOutcome,
+        FixSource, FreeFrame, MAX_PREFETCH_IN_FLIGHT,
     };
 
     #[derive(Debug)]
@@ -2233,9 +2339,17 @@ mod tests {
     }
 
     fn manager(frame_count: usize, read_latency_us: u64) -> Arc<BufferManager> {
+        manager_with_mode(frame_count, read_latency_us, EvictionMode::Demand)
+    }
+
+    fn manager_with_mode(
+        frame_count: usize,
+        read_latency_us: u64,
+        eviction_mode: EvictionMode,
+    ) -> Arc<BufferManager> {
         let tier = MockTier::with_options(
             "mock",
-            (PAGE_SIZE * 16) as u64,
+            (PAGE_SIZE * frame_count.saturating_mul(4).max(16)) as u64,
             0.0,
             LatencyProfile::new(read_latency_us, 0, 0.0),
             None,
@@ -2244,10 +2358,19 @@ mod tests {
         BufferManager::new(BufConfig {
             dram_pool_bytes: frame_count * PAGE_SIZE,
             cooling_ratio: 0.1,
+            eviction_mode,
             economics: Economics::default(),
             tiers: vec![Box::new(tier) as Box<dyn TierBackend>],
         })
         .expect("valid buffer manager")
+    }
+
+    fn stop_background_workers(manager: &BufferManager) {
+        manager.stopping.store(true, Ordering::Release);
+        manager.worker_signal.notify();
+        manager.cooler_signal.notify();
+        manager.join_workers().expect("background workers stop");
+        manager.stopping.store(false, Ordering::Release);
     }
 
     fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
@@ -2418,6 +2541,7 @@ mod tests {
         let manager = BufferManager::new(BufConfig {
             dram_pool_bytes: 2 * PAGE_SIZE,
             cooling_ratio: 0.0,
+            eviction_mode: EvictionMode::Demand,
             economics: Economics::default(),
             tiers: vec![Box::new(BlockingFailureTier::new(Arc::clone(&injection)))],
         })
@@ -2554,9 +2678,13 @@ mod tests {
         allocated.write_with(|page| page[0] = 0x44);
         drop(allocated);
 
-        drop(manager.fix_shared(&swip).expect("resident hit"));
+        let resident = manager.fix_shared(&swip).expect("resident hit");
+        assert_eq!(resident.source(), FixSource::Dram);
+        drop(resident);
         manager.manual_evict(&swip).expect("manual eviction");
-        drop(manager.fix_shared(&swip).expect("faulted fix"));
+        let faulted = manager.fix_shared(&swip).expect("faulted fix");
+        assert_eq!(faulted.source(), FixSource::LowerTier);
+        drop(faulted);
 
         let stats = manager.stats();
         assert_eq!(stats.dram_hits, 1);
@@ -2564,6 +2692,7 @@ mod tests {
         assert_eq!(stats.evictions, 1);
         assert_eq!(stats.tiers.len(), 1);
         assert_eq!(stats.tiers[0].name, "mock");
+        assert_eq!(stats.tiers[0].demand_hits, 1);
         assert_eq!(stats.tiers[0].reads, 1);
         assert_eq!(stats.tiers[0].writes, 1);
         assert_eq!(stats.tiers[0].bytes_read, PAGE_SIZE as u64);
@@ -2649,7 +2778,58 @@ mod tests {
         let stats = manager.stats();
         assert!(stats.evictions >= 6);
         assert!(stats.faults >= 8);
-        assert_eq!(manager.frames.free_count(), 0);
+        assert!(
+            manager.frames.free_count() <= manager.low_watermark,
+            "pressure may leave at most the configured low-watermark reserve"
+        );
+    }
+
+    #[test]
+    fn resident_working_set_churn_depends_on_eviction_mode() {
+        fn run_epochs(mode: EvictionMode) -> u64 {
+            let manager = manager_with_mode(10, 0, mode);
+            stop_background_workers(&manager);
+            for _ in 0..10 {
+                drop(manager.allocate().expect("resident working-set page"));
+            }
+
+            let before = manager.stats().evictions;
+            for _ in 0..10 {
+                manager.tick_epoch(Duration::from_millis(1));
+                manager.background_cooling_step();
+            }
+            manager.stats().evictions - before
+        }
+
+        assert_eq!(run_epochs(EvictionMode::Demand), 0);
+        assert!(run_epochs(EvictionMode::Watermark) > 0);
+    }
+
+    #[test]
+    fn exhausted_frame_request_notifies_and_activates_cooler() {
+        let manager = manager(1, 0);
+        stop_background_workers(&manager);
+        let pinned = manager.allocate().expect("pinned frame");
+        let evictions_before = manager.stats().evictions;
+        let before = *manager
+            .cooler_signal
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(matches!(
+            manager.allocate(),
+            Err(TierBufError::PoolExhausted)
+        ));
+        let after = *manager
+            .cooler_signal
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(after > before);
+        drop(pinned);
+        manager.background_cooling_step();
+        assert_eq!(manager.stats().evictions, evictions_before + 1);
     }
 
     #[test]
@@ -2770,6 +2950,7 @@ mod tests {
             BufConfig {
                 dram_pool_bytes: PAGE_SIZE,
                 cooling_ratio: 0.1,
+                eviction_mode: EvictionMode::Demand,
                 economics: Economics::default(),
                 tiers: vec![Box::new(warm), Box::new(cold)],
             },
@@ -2911,6 +3092,7 @@ mod tests {
         let prefetched = manager.stats();
         assert_eq!(prefetched.prefetch_submitted, before.prefetch_submitted + 1);
         assert_eq!(prefetched.faults, before.faults + 1);
+        assert_eq!(prefetched.tiers[0].demand_hits, before.tiers[0].demand_hits);
 
         let guard = manager.fix_shared(&swip).expect("prefetched demand hit");
         guard.read_with(|page| assert_eq!(page[0], 0x9a));
@@ -2918,6 +3100,11 @@ mod tests {
         let demanded = manager.stats();
         assert_eq!(demanded.faults, prefetched.faults);
         assert_eq!(demanded.prefetch_hits, prefetched.prefetch_hits + 1);
+        assert_eq!(
+            demanded.tiers[0].demand_hits,
+            prefetched.tiers[0].demand_hits
+        );
+        assert_eq!(demanded.dram_hits, prefetched.dram_hits + 1);
     }
 
     #[test]
@@ -2992,6 +3179,7 @@ mod tests {
         let manager = BufferManager::new(BufConfig {
             dram_pool_bytes: 2 * PAGE_SIZE,
             cooling_ratio: 0.1,
+            eviction_mode: EvictionMode::Demand,
             economics: Economics::default(),
             tiers: vec![Box::new(tier)],
         })
@@ -3030,6 +3218,7 @@ mod tests {
         let manager = BufferManager::new(BufConfig {
             dram_pool_bytes: REQUESTS * PAGE_SIZE,
             cooling_ratio: 0.0,
+            eviction_mode: EvictionMode::Demand,
             economics: Economics::default(),
             tiers: vec![Box::new(tier)],
         })
