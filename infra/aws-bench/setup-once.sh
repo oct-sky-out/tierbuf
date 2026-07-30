@@ -13,34 +13,82 @@ for name in REGION BUCKET ROLE_NAME PROFILE_NAME SG_NAME; do
   fi
 done
 
-echo "[1/4] S3 bucket: ${BUCKET}"
-if ! aws s3api head-bucket --bucket "${BUCKET}" 2>/dev/null; then
-  if [ "${REGION}" = "us-east-1" ]; then
-    aws s3api create-bucket --bucket "${BUCKET}" --region "${REGION}"
-  else
-    aws s3api create-bucket --bucket "${BUCKET}" --region "${REGION}" \
-      --create-bucket-configuration "LocationConstraint=${REGION}"
+if [ -n "${BENCH_S3_BUCKET:-}" ]; then
+  if [ -z "${BENCH_S3_REGION:-}" ]; then
+    echo "bench.env: BENCH_S3_REGION must be set when BENCH_S3_BUCKET is set" >&2
+    exit 2
+  fi
+  if [ "${BENCH_S3_BUCKET}" = "${BUCKET}" ]; then
+    echo "bench.env: BENCH_S3_BUCKET must differ from the result BUCKET" >&2
+    exit 2
   fi
 fi
-aws s3api put-public-access-block --bucket "${BUCKET}" \
-  --public-access-block-configuration \
-  "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-aws s3api put-bucket-encryption --bucket "${BUCKET}" \
-  --server-side-encryption-configuration \
-  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+configure_bucket() {
+  local bucket=$1
+  local region=$2
+
+  if ! aws s3api head-bucket --bucket "${bucket}" \
+    --region "${region}" 2>/dev/null; then
+    if [ "${region}" = "us-east-1" ]; then
+      aws s3api create-bucket --bucket "${bucket}" --region "${region}"
+    else
+      aws s3api create-bucket --bucket "${bucket}" --region "${region}" \
+        --create-bucket-configuration "LocationConstraint=${region}"
+    fi
+  fi
+  aws s3api put-public-access-block --bucket "${bucket}" \
+    --region "${region}" \
+    --public-access-block-configuration \
+    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+  aws s3api put-bucket-encryption --bucket "${bucket}" \
+    --region "${region}" \
+    --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+}
+
+echo "[1/4] Result S3 bucket: ${BUCKET}"
+configure_bucket "${BUCKET}" "${REGION}"
+
+if [ -n "${BENCH_S3_BUCKET:-}" ]; then
+  echo "[1/4] Benchmark-data S3 bucket: ${BENCH_S3_BUCKET}"
+  configure_bucket "${BENCH_S3_BUCKET}" "${BENCH_S3_REGION}"
+  aws s3api put-bucket-lifecycle-configuration \
+    --bucket "${BENCH_S3_BUCKET}" \
+    --region "${BENCH_S3_REGION}" \
+    --lifecycle-configuration \
+    '{"Rules":[{"ID":"expire-tierbuf-bench-objects","Status":"Enabled","Filter":{"Prefix":"tierbuf-bench/"},"Expiration":{"Days":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
+else
+  echo "[1/4] Benchmark-data S3 bucket disabled (BENCH_S3_BUCKET is empty)"
+fi
 
 echo "[2/4] IAM role: ${ROLE_NAME}"
 TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 aws iam get-role --role-name "${ROLE_NAME}" >/dev/null 2>&1 ||
   aws iam create-role --role-name "${ROLE_NAME}" \
     --assume-role-policy-document "${TRUST}" >/dev/null
-POLICY=$(printf '%s' \
+RESULTS_POLICY=$(printf '%s' \
   '{"Version":"2012-10-17","Statement":[' \
   "{\"Effect\":\"Allow\",\"Action\":\"s3:PutObject\",\"Resource\":\"arn:aws:s3:::${BUCKET}/results/*\"}," \
   "{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::${BUCKET}\",\"Condition\":{\"StringLike\":{\"s3:prefix\":\"results/*\"}}}" \
   ']}')
 aws iam put-role-policy --role-name "${ROLE_NAME}" \
-  --policy-name s3-results --policy-document "${POLICY}"
+  --policy-name s3-results --policy-document "${RESULTS_POLICY}"
+
+if [ -n "${BENCH_S3_BUCKET:-}" ]; then
+  BENCH_DATA_POLICY=$(printf '%s' \
+    '{"Version":"2012-10-17","Statement":[' \
+    "{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\"],\"Resource\":\"arn:aws:s3:::${BENCH_S3_BUCKET}/tierbuf-bench/*\"}," \
+    "{\"Effect\":\"Allow\",\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::${BENCH_S3_BUCKET}\",\"Condition\":{\"StringLike\":{\"s3:prefix\":\"tierbuf-bench/*\"}}}" \
+    ']}')
+  aws iam put-role-policy --role-name "${ROLE_NAME}" \
+    --policy-name s3-benchmark-data --policy-document "${BENCH_DATA_POLICY}"
+elif aws iam get-role-policy --role-name "${ROLE_NAME}" \
+  --policy-name s3-benchmark-data >/dev/null 2>&1; then
+  echo "Removing stale s3-benchmark-data policy"
+  aws iam delete-role-policy --role-name "${ROLE_NAME}" \
+    --policy-name s3-benchmark-data
+fi
 
 echo "[3/4] Instance profile: ${PROFILE_NAME}"
 if ! aws iam get-instance-profile --instance-profile-name "${PROFILE_NAME}" >/dev/null 2>&1; then

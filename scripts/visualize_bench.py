@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from string import Template
-from typing import Sequence
+from typing import Mapping, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -51,6 +53,30 @@ class HotPathEstimate:
 
     label: str
     mean_ns: float
+
+
+@dataclass(frozen=True)
+class S3StatsPoint:
+    """S3 counters captured for one benchmark resident fraction."""
+
+    fraction: float
+    get_requests: int
+    put_requests: int
+    delete_requests: int
+    request_failures: int
+    stored_bytes: int
+    logical_bytes: int
+    bytes_uploaded: int
+    bytes_downloaded: int
+    compression_ratio: float | None
+
+
+@dataclass(frozen=True)
+class S3StatsRun:
+    """S3 counter points associated with one benchmark CSV run."""
+
+    label: str
+    points: tuple[S3StatsPoint, ...]
 
 
 def load_runs(paths: Sequence[Path], labels: Sequence[str] | None) -> list[Run]:
@@ -106,11 +132,278 @@ def read_mean_ns(path: Path) -> float:
     return mean
 
 
+def load_s3_stats(paths: Sequence[Path], runs: Sequence[Run]) -> list[S3StatsRun]:
+    """Load one S3 stats JSON document for each benchmark CSV run."""
+
+    if len(paths) != len(runs):
+        raise degradation.CurveDataError(
+            f"--stats expected {len(runs)} value(s), got {len(paths)}"
+        )
+
+    stats_runs = []
+    for path, run in zip(paths, runs):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise degradation.CurveDataError(
+                f"{path}: could not read benchmark stats JSON"
+            ) from error
+        if not isinstance(payload, dict) or not isinstance(payload.get("runs"), list):
+            raise degradation.CurveDataError(
+                f"{path}: benchmark stats JSON must contain a runs array"
+            )
+
+        points_by_fraction = {}
+        for index, value in enumerate(payload["runs"]):
+            context = f"{path}: runs[{index}]"
+            if not isinstance(value, dict):
+                raise degradation.CurveDataError(f"{context} must be an object")
+            fraction = _stats_fraction(value, context)
+            if fraction in points_by_fraction:
+                raise degradation.CurveDataError(
+                    f"{path}: duplicate stats fraction {fraction:g}"
+                )
+            record = _s3_record(value, context)
+            points_by_fraction[fraction] = _s3_stats_point(
+                fraction, record, context
+            )
+
+        expected_fractions = {point.fraction for point in run.points}
+        actual_fractions = set(points_by_fraction)
+        if actual_fractions != expected_fractions:
+            missing = sorted(expected_fractions - actual_fractions, reverse=True)
+            extra = sorted(actual_fractions - expected_fractions, reverse=True)
+            details = []
+            if missing:
+                details.append(
+                    "missing " + ", ".join(f"{fraction:g}" for fraction in missing)
+                )
+            if extra:
+                details.append(
+                    "unexpected " + ", ".join(f"{fraction:g}" for fraction in extra)
+                )
+            raise degradation.CurveDataError(
+                f"{path}: stats fractions do not match {run.label}: "
+                + "; ".join(details)
+            )
+
+        stats_runs.append(
+            S3StatsRun(
+                label=run.label,
+                points=tuple(
+                    points_by_fraction[point.fraction] for point in run.points
+                ),
+            )
+        )
+    return stats_runs
+
+
+def _stats_fraction(value: Mapping[str, object], context: str) -> float:
+    """Read and validate one stats run's DRAM resident fraction."""
+
+    raw_fraction = value.get("fraction")
+    if isinstance(raw_fraction, bool):
+        raise degradation.CurveDataError(f"{context}.fraction must be numeric")
+    try:
+        fraction = float(raw_fraction)
+    except (TypeError, ValueError) as error:
+        raise degradation.CurveDataError(
+            f"{context}.fraction must be numeric"
+        ) from error
+    if not math.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
+        raise degradation.CurveDataError(
+            f"{context}.fraction must be finite and in (0, 1]"
+        )
+    return fraction
+
+
+def _s3_record(
+    value: Mapping[str, object],
+    context: str,
+) -> Mapping[str, object]:
+    """Find the S3 counter object embedded in one stats run."""
+
+    direct = value.get("s3")
+    if isinstance(direct, dict):
+        return direct
+
+    records = _collect_s3_records(value)
+    if not records:
+        raise degradation.CurveDataError(f"{context} does not contain S3 stats")
+    if len(records) != 1:
+        raise degradation.CurveDataError(
+            f"{context} contains multiple ambiguous S3 stats records"
+        )
+    return records[0]
+
+
+def _collect_s3_records(value: object) -> list[Mapping[str, object]]:
+    """Recursively collect named S3 counter records from a JSON value."""
+
+    records: list[Mapping[str, object]] = []
+    if isinstance(value, dict):
+        direct = value.get("s3")
+        if isinstance(direct, dict):
+            records.append(direct)
+        elif value.get("name") == "s3" and any(
+            key in value
+            for key in (
+                "get_requests",
+                "put_requests",
+                "bytes_uploaded",
+                "bytes_downloaded",
+            )
+        ):
+            records.append(value)
+        for key, child in value.items():
+            if key != "s3":
+                records.extend(_collect_s3_records(child))
+    elif isinstance(value, list):
+        for child in value:
+            records.extend(_collect_s3_records(child))
+    return records
+
+
+def _s3_stats_point(
+    fraction: float,
+    record: Mapping[str, object],
+    context: str,
+) -> S3StatsPoint:
+    """Validate one S3 record and turn it into a renderable point."""
+
+    counter_names = (
+        "get_requests",
+        "put_requests",
+        "delete_requests",
+        "request_failures",
+        "stored_bytes",
+        "logical_bytes",
+        "bytes_uploaded",
+        "bytes_downloaded",
+    )
+    counters = {
+        name: _nonnegative_integer(record, name, context) for name in counter_names
+    }
+    compression_ratio = _compression_ratio(record, counters, context)
+    return S3StatsPoint(
+        fraction=fraction,
+        compression_ratio=compression_ratio,
+        **counters,
+    )
+
+
+def _nonnegative_integer(
+    record: Mapping[str, object],
+    name: str,
+    context: str,
+) -> int:
+    """Read one required non-negative integer S3 counter."""
+
+    value = record.get(name)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise degradation.CurveDataError(
+            f"{context}.s3.{name} must be a non-negative integer"
+        )
+    return value
+
+
+def _compression_ratio(
+    record: Mapping[str, object],
+    counters: Mapping[str, int],
+    context: str,
+) -> float | None:
+    """Read or derive the stored-to-logical compression ratio."""
+
+    value = record.get("compression_ratio")
+    if value is None:
+        logical_bytes = counters["logical_bytes"]
+        if logical_bytes == 0:
+            return None
+        return counters["stored_bytes"] / logical_bytes
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise degradation.CurveDataError(
+            f"{context}.s3.compression_ratio must be numeric or null"
+        )
+    ratio = float(value)
+    if not math.isfinite(ratio) or ratio < 0.0:
+        raise degradation.CurveDataError(
+            f"{context}.s3.compression_ratio must be finite and non-negative"
+        )
+    return ratio
+
+
+def render_s3_stats_section(stats_runs: Sequence[S3StatsRun]) -> str:
+    """Render the optional S3 request, transfer, and compression panel."""
+
+    rows = []
+    for run in stats_runs:
+        for point in sorted(run.points, key=lambda item: item.fraction, reverse=True):
+            ratio = (
+                "n/a"
+                if point.compression_ratio is None
+                else f"{point.compression_ratio:.3f}x"
+            )
+            rows.append(
+                "            <tr>\n"
+                f"              <td>{html.escape(run.label)}</td>\n"
+                f"              <td>{point.fraction:.3%}</td>\n"
+                f"              <td>{point.get_requests:,}</td>\n"
+                f"              <td>{point.put_requests:,}</td>\n"
+                f"              <td>{point.delete_requests:,}</td>\n"
+                f"              <td>{point.request_failures:,}</td>\n"
+                f"              <td>{_format_bytes(point.bytes_uploaded)}</td>\n"
+                f"              <td>{_format_bytes(point.bytes_downloaded)}</td>\n"
+                f"              <td>{ratio}</td>\n"
+                "            </tr>"
+            )
+
+    return """
+      <section class="wide">
+        <h2>S3 requests, transfer, and compression</h2>
+        <p>Counters captured for each run and DRAM fraction. Compression is stored envelope bytes divided by logical page bytes.</p>
+        <table>
+          <thead>
+            <tr>
+              <th>Run</th>
+              <th>DRAM resident</th>
+              <th>GET requests</th>
+              <th>PUT requests</th>
+              <th>DELETE requests</th>
+              <th>Failed requests</th>
+              <th>Uploaded</th>
+              <th>Downloaded</th>
+              <th>Stored / logical</th>
+            </tr>
+          </thead>
+          <tbody>
+""" + "\n".join(rows) + """
+          </tbody>
+        </table>
+      </section>"""
+
+
+def _format_bytes(byte_count: int) -> str:
+    """Format an integer byte count using a compact binary unit."""
+
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    value = float(byte_count)
+    unit = units[0]
+    for candidate in units:
+        unit = candidate
+        if value < 1024.0 or candidate == units[-1]:
+            break
+        value /= 1024.0
+    if unit == "B":
+        return f"{byte_count} B"
+    return f"{value:.2f} {unit}"
+
+
 def render_report(
     runs: Sequence[Run],
     dram_price: float = DRAM_PRICE_GIB_MONTH,
     lower_price: float = LOWER_PRICE_GIB_MONTH,
     hotpath: Sequence[HotPathEstimate] = (),
+    s3_stats: Sequence[S3StatsRun] = (),
 ) -> str:
     """Render a full standalone HTML report using the chat dashboard layout."""
 
@@ -145,6 +438,9 @@ def render_report(
     hotpath_payload = [
         {"label": estimate.label, "meanNs": estimate.mean_ns} for estimate in hotpath
     ]
+    s3_stats_section = (
+        render_s3_stats_section(s3_stats) if s3_stats else ""
+    )
 
     hotpath_section = ""
     if hotpath_payload:
@@ -198,6 +494,7 @@ def render_report(
         throughput_limit=degradation.THROUGHPUT_RATIO_LIMIT,
         p99_limit=degradation.P99_RATIO_LIMIT,
         hotpath_section=hotpath_section,
+        s3_stats_section=s3_stats_section,
         extended_sections=extended_sections,
     )
 
@@ -403,7 +700,7 @@ HTML_TEMPLATE = Template(
         </svg>
       </section>
 $extended_sections
-$hotpath_section
+$hotpath_section$s3_stats_section
       <section class="wide">
         <h2>Summary by DRAM resident fraction</h2>
         <table>
@@ -892,6 +1189,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="optional display labels, one per CSV file",
     )
     parser.add_argument(
+        "--stats",
+        nargs="+",
+        type=Path,
+        help="optional S3 stats JSON file(s), one per CSV file",
+    )
+    parser.add_argument(
         "--dram-price",
         type=float,
         default=DRAM_PRICE_GIB_MONTH,
@@ -929,6 +1232,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = build_parser().parse_args(argv)
     try:
         runs = load_runs(arguments.csv_paths, arguments.labels)
+        s3_stats = (
+            load_s3_stats(arguments.stats, runs)
+            if arguments.stats is not None
+            else []
+        )
         if arguments.dram_price <= 0.0:
             raise degradation.CurveDataError("--dram-price must be positive")
         if arguments.lower_price <= 0.0:
@@ -943,6 +1251,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             dram_price=arguments.dram_price,
             lower_price=arguments.lower_price,
             hotpath=hotpath,
+            s3_stats=s3_stats,
         )
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.write_text(report, encoding="utf-8")
