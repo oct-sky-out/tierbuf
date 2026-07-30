@@ -345,6 +345,21 @@ mod tests {
         unsafe { ResidentAddr::from_non_null(NonNull::from(value)) }
     }
 
+    #[cfg(not(miri))]
+    fn page_id_proptest_config() -> ProptestConfig {
+        ProptestConfig::with_cases(256)
+    }
+
+    #[cfg(miri)]
+    fn page_id_proptest_config() -> ProptestConfig {
+        let mut config = ProptestConfig::with_cases(32);
+        // Miri's default isolation rejects the filesystem access used by
+        // proptest's source-file failure persistence. Keep isolation enabled
+        // and disable only persistence for this pure round trip.
+        config.failure_persistence = None;
+        config
+    }
+
     #[test]
     fn evicted_page_id_round_trips_for_boundary_and_patterned_values() {
         let mut values = vec![
@@ -368,7 +383,7 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(256))]
+        #![proptest_config(page_id_proptest_config())]
 
         #[test]
         fn arbitrary_valid_page_id_round_trips(value in 0_u64..=PageId::MAX) {
