@@ -41,17 +41,18 @@ struct IntegrationEnvironment {
 
 impl IntegrationEnvironment {
     fn load() -> Option<Self> {
+        let endpoint = required_environment("TIERBUF_S3_ENDPOINT")?;
+        let bucket = required_environment("TIERBUF_S3_BUCKET")?;
+        let region = required_environment("TIERBUF_S3_REGION")?;
+        // CredentialSource::Environment reads the values again when each
+        // request is signed. Requiring them here keeps partial configurations
+        // from accidentally reaching a real endpoint.
+        required_environment("AWS_ACCESS_KEY_ID")?;
+        required_environment("AWS_SECRET_ACCESS_KEY")?;
         Some(Self {
-            endpoint: required_environment("TIERBUF_S3_ENDPOINT")?,
-            bucket: required_environment("TIERBUF_S3_BUCKET")?,
-            region: required_environment("TIERBUF_S3_REGION")?,
-            // CredentialSource::Environment reads the values again when each
-            // request is signed. Requiring them here keeps partial
-            // configurations from accidentally reaching a real endpoint.
-        })
-        .filter(|_| {
-            required_environment("AWS_ACCESS_KEY_ID").is_some()
-                && required_environment("AWS_SECRET_ACCESS_KEY").is_some()
+            endpoint,
+            bucket,
+            region,
         })
     }
 
