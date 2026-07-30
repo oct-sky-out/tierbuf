@@ -11,6 +11,8 @@ use std::io;
 
 use thiserror::Error;
 
+mod atomic;
+
 /// The fixed page and frame size used by tierbuf, in bytes.
 pub const PAGE_SIZE: usize = 64 * 1024;
 

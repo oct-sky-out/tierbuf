@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
+use crate::atomic::try_update_u64;
+
 const BYTES_PER_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 const SECONDS_PER_MONTH: f64 = 30.0 * 24.0 * 60.0 * 60.0;
 const DRAM_TIER_NAME: &str = "dram";
@@ -318,7 +320,7 @@ impl StatsRecorder {
 }
 
 fn saturating_add(counter: &AtomicU64, amount: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = try_update_u64(counter, Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(amount))
     });
 }
