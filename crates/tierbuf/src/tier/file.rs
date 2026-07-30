@@ -9,7 +9,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::{PAGE_SIZE, Result, TierBufError};
 
-use super::{LatencyProfile, TierBackend, TierOffset, WriteBudget};
+use super::envelope::{PageCodec, decode_page, encode_page};
+use super::{LatencyProfile, RequestCosts, TierBackend, TierOffset, WriteBudget};
+
+const DIRECT_IO_BLOCK_SIZE: usize = 4096;
 
 /// Controls whether a file tier requests Linux `O_DIRECT`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -42,6 +45,9 @@ pub struct FileTierConfig {
     /// Storage price in dollars per GiB-month.
     pub price_gb_month: f64,
 
+    /// Per-request monetary costs used by the placement policy.
+    pub request_costs: RequestCosts,
+
     /// Representative latency and throughput policy inputs.
     pub latency: LatencyProfile,
 
@@ -50,6 +56,14 @@ pub struct FileTierConfig {
 
     /// Direct-I/O behavior for the backing file.
     pub direct_io: DirectIo,
+
+    /// Codec used for file-slot storage.
+    ///
+    /// [`PageCodec::None`] preserves the raw fixed-slot representation and
+    /// permits Linux `io_uring` reads through [`TierBackend::raw_fd`].
+    /// [`PageCodec::Lz4`] stores a page envelope only when the complete
+    /// envelope fits inside one slot; otherwise the page is stored raw.
+    pub codec: PageCodec,
 }
 
 impl FileTierConfig {
@@ -60,19 +74,24 @@ impl FileTierConfig {
             name: "file".to_owned(),
             capacity_bytes,
             price_gb_month: 0.0,
+            request_costs: RequestCosts::default(),
             latency: LatencyProfile::default(),
             write_budget: None,
             direct_io: DirectIo::Preferred,
+            codec: PageCodec::None,
         }
     }
 }
 
 /// A fixed-page storage tier backed by one pre-sized file.
 ///
-/// Opening a tier creates or truncates its backing file because v0.1 keeps the
+/// Opening a tier creates or truncates its backing file because tierbuf keeps the
 /// logical page directory in memory rather than recovering it from disk. The
-/// file is split into [`PAGE_SIZE`]-byte slots; freed slots are reused before
-/// the tier grows into a never-used slot.
+/// file is split into [`PAGE_SIZE`]-byte logical slots; freed slots are reused
+/// before the tier grows into a never-used slot. With LZ4 enabled, a slot may
+/// contain a shorter checksummed envelope, but capacity and [`TierBackend::used_bytes`]
+/// remain fixed-slot logical accounting. The buffer manager likewise charges
+/// [`PAGE_SIZE`] to the write budget conservatively.
 ///
 /// I/O and slot metadata changes are serialized under one mutex. This keeps a
 /// read from racing with `free` and slot reuse. Later phases may replace this
@@ -85,18 +104,30 @@ pub struct FileTier {
     file: File,
     capacity_bytes: u64,
     price_gb_month: f64,
+    request_costs: RequestCosts,
     latency: LatencyProfile,
     write_budget: Option<WriteBudget>,
     direct_io_active: bool,
+    codec: PageCodec,
     state: Mutex<SlotState>,
 }
 
 #[derive(Debug)]
 struct SlotState {
-    allocated: Vec<bool>,
+    storage: Vec<SlotStorage>,
     free_slots: Vec<usize>,
     next_slot: usize,
     used_slots: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SlotStorage {
+    #[default]
+    Free,
+    Raw,
+    Envelope {
+        stored_len: usize,
+    },
 }
 
 #[repr(C, align(65536))]
@@ -133,11 +164,13 @@ impl FileTier {
             file,
             capacity_bytes: config.capacity_bytes,
             price_gb_month: config.price_gb_month,
+            request_costs: config.request_costs,
             latency: config.latency,
             write_budget: config.write_budget,
             direct_io_active,
+            codec: config.codec,
             state: Mutex::new(SlotState {
-                allocated: vec![false; slot_count],
+                storage: vec![SlotStorage::Free; slot_count],
                 free_slots: Vec::new(),
                 next_slot: 0,
                 used_slots: 0,
@@ -187,7 +220,7 @@ impl FileTier {
             .map_err(|_| invalid_input("file tier slot does not fit this process"))
     }
 
-    fn read_page(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+    fn read_raw_page(&self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
         if self.direct_io_active {
             let mut aligned = Box::new(AlignedPage([0; PAGE_SIZE]));
             read_exact_at(&self.file, &mut aligned.0, offset)?;
@@ -198,7 +231,7 @@ impl FileTier {
         }
     }
 
-    fn write_page(&self, offset: u64, buffer: &[u8]) -> io::Result<()> {
+    fn write_raw_page(&self, offset: u64, buffer: &[u8]) -> io::Result<()> {
         if self.direct_io_active {
             let mut aligned = Box::new(AlignedPage([0; PAGE_SIZE]));
             aligned.0.copy_from_slice(buffer);
@@ -206,6 +239,31 @@ impl FileTier {
         } else {
             write_all_at(&self.file, buffer, offset)
         }
+    }
+
+    fn read_envelope(&self, offset: u64, stored_len: usize, out: &mut [u8]) -> Result<()> {
+        if self.direct_io_active {
+            let io_len = direct_io_len(stored_len)?;
+            let mut aligned = Box::new(AlignedPage([0; PAGE_SIZE]));
+            read_exact_at(&self.file, &mut aligned.0[..io_len], offset)?;
+            decode_page(&aligned.0[..stored_len], out)
+        } else {
+            let mut envelope = vec![0; stored_len];
+            read_exact_at(&self.file, &mut envelope, offset)?;
+            decode_page(&envelope, out)
+        }
+    }
+
+    fn write_envelope(&self, offset: u64, envelope: &[u8]) -> Result<()> {
+        if self.direct_io_active {
+            let io_len = direct_io_len(envelope.len())?;
+            let mut aligned = Box::new(AlignedPage([0; PAGE_SIZE]));
+            aligned.0[..envelope.len()].copy_from_slice(envelope);
+            write_all_at(&self.file, &aligned.0[..io_len], offset)?;
+        } else {
+            write_all_at(&self.file, envelope, offset)?;
+        }
+        Ok(())
     }
 }
 
@@ -218,24 +276,38 @@ impl TierBackend for FileTier {
         validate_page_buffer(buffer.len())?;
         let slot = self.slot_for_location(location)?;
         let state = self.lock_state();
-        if !state.allocated[slot] {
-            return Err(
-                io::Error::new(io::ErrorKind::NotFound, "file tier page is not allocated").into(),
-            );
-        }
-
-        self.read_page(location.get(), buffer)?;
-        Ok(())
+        let result = match state.storage[slot] {
+            SlotStorage::Free => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "file tier page is not allocated",
+            )
+            .into()),
+            SlotStorage::Raw => self
+                .read_raw_page(location.get(), buffer)
+                .map_err(Into::into),
+            SlotStorage::Envelope { stored_len } => {
+                self.read_envelope(location.get(), stored_len, buffer)
+            }
+        };
+        drop(state);
+        result
     }
 
     fn write(&self, buffer: &[u8]) -> Result<TierOffset> {
         validate_page_buffer(buffer.len())?;
+        let envelope = match self.codec {
+            PageCodec::None => None,
+            PageCodec::Lz4 => {
+                let encoded = encode_page(buffer, PageCodec::Lz4)?;
+                envelope_fits_slot(encoded.len()).then_some(encoded)
+            }
+        };
         let mut state = self.lock_state();
 
         let reused_slot = state.free_slots.last().copied();
         let slot = if let Some(slot) = reused_slot {
             slot
-        } else if state.next_slot < state.allocated.len() {
+        } else if state.next_slot < state.storage.len() {
             state.next_slot
         } else {
             return Err(
@@ -243,11 +315,23 @@ impl TierBackend for FileTier {
             );
         };
 
-        debug_assert!(!state.allocated[slot], "allocated slot selected for write");
+        debug_assert_eq!(
+            state.storage[slot],
+            SlotStorage::Free,
+            "allocated slot selected for write"
+        );
         let offset = (slot as u64)
             .checked_mul(PAGE_SIZE as u64)
             .ok_or_else(|| io::Error::other("file tier offset overflow"))?;
-        self.write_page(offset, buffer)?;
+        let storage = if let Some(envelope) = envelope.as_deref() {
+            self.write_envelope(offset, envelope)?;
+            SlotStorage::Envelope {
+                stored_len: envelope.len(),
+            }
+        } else {
+            self.write_raw_page(offset, buffer)?;
+            SlotStorage::Raw
+        };
 
         if reused_slot.is_some() {
             let removed = state.free_slots.pop();
@@ -255,7 +339,7 @@ impl TierBackend for FileTier {
         } else {
             state.next_slot += 1;
         }
-        state.allocated[slot] = true;
+        state.storage[slot] = storage;
         state.used_slots += 1;
 
         Ok(TierOffset::new(offset))
@@ -267,8 +351,8 @@ impl TierBackend for FileTier {
         };
 
         let mut state = self.lock_state();
-        if state.allocated[slot] {
-            state.allocated[slot] = false;
+        if state.storage[slot] != SlotStorage::Free {
+            state.storage[slot] = SlotStorage::Free;
             state.free_slots.push(slot);
             state.used_slots -= 1;
         }
@@ -287,6 +371,10 @@ impl TierBackend for FileTier {
         self.price_gb_month
     }
 
+    fn request_costs(&self) -> RequestCosts {
+        self.request_costs
+    }
+
     fn write_budget(&self) -> Option<&WriteBudget> {
         self.write_budget.as_ref()
     }
@@ -296,7 +384,7 @@ impl TierBackend for FileTier {
     }
 
     fn raw_fd(&self) -> Option<RawFd> {
-        Some(self.file.as_raw_fd())
+        (self.codec == PageCodec::None).then(|| self.file.as_raw_fd())
     }
 }
 
@@ -315,12 +403,44 @@ fn validate_config(config: &FileTierConfig) -> Result<()> {
             "file tier price must be finite and greater than or equal to zero",
         ));
     }
+    if !config.request_costs.read_usd.is_finite()
+        || config.request_costs.read_usd.is_sign_negative()
+        || !config.request_costs.write_usd.is_finite()
+        || config.request_costs.write_usd.is_sign_negative()
+    {
+        return Err(invalid_input(
+            "file tier request costs must be finite and greater than or equal to zero",
+        ));
+    }
     if !config.latency.seq_gbps.is_finite() || config.latency.seq_gbps.is_sign_negative() {
         return Err(invalid_input(
             "file tier throughput must be finite and greater than or equal to zero",
         ));
     }
+    #[cfg(not(feature = "lz4"))]
+    if config.codec == PageCodec::Lz4 {
+        return Err(invalid_input(
+            "FileTier LZ4 compression requires you to enable the `lz4` feature",
+        ));
+    }
     Ok(())
+}
+
+fn envelope_fits_slot(envelope_len: usize) -> bool {
+    envelope_len < PAGE_SIZE
+}
+
+fn direct_io_len(stored_len: usize) -> Result<usize> {
+    if stored_len == 0 || !envelope_fits_slot(stored_len) {
+        return Err(invalid_input(
+            "compressed file-tier length must fit within one page slot",
+        ));
+    }
+    stored_len
+        .checked_add(DIRECT_IO_BLOCK_SIZE - 1)
+        .map(|length| length / DIRECT_IO_BLOCK_SIZE * DIRECT_IO_BLOCK_SIZE)
+        .filter(|length| *length <= PAGE_SIZE)
+        .ok_or_else(|| invalid_input("compressed file-tier I/O length overflow"))
 }
 
 #[cfg(target_os = "linux")]
@@ -452,14 +572,19 @@ fn invalid_input(message: &'static str) -> TierBufError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(feature = "lz4")]
+    use std::fs::OpenOptions;
     use std::io;
+    #[cfg(feature = "lz4")]
+    use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::{PAGE_SIZE, TierBufError};
 
     use super::{
-        DirectIo, FileTier, FileTierConfig, LatencyProfile, TierBackend, TierOffset, WriteBudget,
+        DirectIo, FileTier, FileTierConfig, LatencyProfile, PageCodec, RequestCosts, SlotStorage,
+        TierBackend, TierOffset, WriteBudget, direct_io_len, envelope_fits_slot,
     };
 
     static NEXT_TEMP_FILE: AtomicU64 = AtomicU64::new(0);
@@ -494,6 +619,23 @@ mod tests {
 
     fn page(fill: u8) -> Vec<u8> {
         vec![fill; PAGE_SIZE]
+    }
+
+    fn pseudo_random_page() -> Vec<u8> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut page = vec![0; PAGE_SIZE];
+        for chunk in page.chunks_exact_mut(size_of::<u64>()) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            chunk.copy_from_slice(&state.to_le_bytes());
+        }
+        page
+    }
+
+    fn slot_storage(tier: &FileTier, location: TierOffset) -> SlotStorage {
+        let slot = usize::try_from(location.get() / PAGE_SIZE as u64).expect("slot index");
+        tier.lock_state().storage[slot]
     }
 
     fn io_kind(error: TierBufError) -> io::ErrorKind {
@@ -602,6 +744,18 @@ mod tests {
         let error = FileTier::open(invalid_path.as_path(), buffered_config(0))
             .expect_err("zero capacity must fail");
         assert_eq!(io_kind(error), io::ErrorKind::InvalidInput);
+
+        let mut nan_cost = buffered_config(1);
+        nan_cost.request_costs.read_usd = f64::NAN;
+        let error = FileTier::open(invalid_path.as_path(), nan_cost)
+            .expect_err("NaN request cost must fail");
+        assert_eq!(io_kind(error), io::ErrorKind::InvalidInput);
+
+        let mut negative_cost = buffered_config(1);
+        negative_cost.request_costs.write_usd = -1.0;
+        let error = FileTier::open(invalid_path.as_path(), negative_cost)
+            .expect_err("negative request cost must fail");
+        assert_eq!(io_kind(error), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -610,6 +764,10 @@ mod tests {
         let mut config = buffered_config(2);
         config.name = "nvme".to_owned();
         config.price_gb_month = 0.17;
+        config.request_costs = RequestCosts {
+            read_usd: 1.0e-8,
+            write_usd: 2.0e-8,
+        };
         config.latency = LatencyProfile::new(80, 120, 3.25);
         config.write_budget = Some(WriteBudget::from_daily_allowance(4 * PAGE_SIZE as u64));
 
@@ -618,6 +776,13 @@ mod tests {
         assert_eq!(tier.path(), temp.as_path());
         assert!(!tier.direct_io_active());
         assert_eq!(tier.price_gb_month(), 0.17);
+        assert_eq!(
+            tier.request_costs(),
+            RequestCosts {
+                read_usd: 1.0e-8,
+                write_usd: 2.0e-8,
+            }
+        );
         assert_eq!(tier.latency(), LatencyProfile::new(80, 120, 3.25));
         assert_eq!(
             tier.write_budget()
@@ -626,6 +791,174 @@ mod tests {
             4 * PAGE_SIZE as u64
         );
         assert!(tier.raw_fd().is_some());
+    }
+
+    #[test]
+    fn default_codec_preserves_raw_slot_bytes_and_raw_fd() {
+        let temp = TempFilePath::new("raw-default");
+        let config = buffered_config(1);
+        assert_eq!(config.codec, PageCodec::None);
+        let tier = FileTier::open(temp.as_path(), config).expect("open raw tier");
+        let expected = pseudo_random_page();
+
+        let location = tier.write(&expected).expect("write raw page");
+
+        assert_eq!(slot_storage(&tier, location), SlotStorage::Raw);
+        assert_eq!(
+            &fs::read(temp.as_path()).expect("read backing file")[..PAGE_SIZE],
+            expected.as_slice()
+        );
+        assert!(tier.raw_fd().is_some());
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn compressed_slot_round_trips_without_changing_logical_accounting() {
+        let temp = TempFilePath::new("compressed");
+        let mut config = buffered_config(1);
+        config.codec = PageCodec::Lz4;
+        let tier = FileTier::open(temp.as_path(), config).expect("open compressed tier");
+        let expected = page(0x5a);
+
+        let location = tier.write(&expected).expect("write compressed page");
+        let SlotStorage::Envelope { stored_len } = slot_storage(&tier, location) else {
+            panic!("compressible page must use an envelope");
+        };
+        assert!(stored_len < PAGE_SIZE);
+        assert_eq!(tier.used_bytes(), PAGE_SIZE as u64);
+        assert!(tier.raw_fd().is_none());
+
+        let mut actual = page(0);
+        tier.read(location, &mut actual)
+            .expect("read compressed page");
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn incompressible_page_falls_back_to_raw_slot() {
+        let temp = TempFilePath::new("incompressible");
+        let mut config = buffered_config(1);
+        config.codec = PageCodec::Lz4;
+        let tier = FileTier::open(temp.as_path(), config).expect("open compressed tier");
+        let expected = pseudo_random_page();
+
+        let location = tier.write(&expected).expect("write incompressible page");
+
+        assert_eq!(slot_storage(&tier, location), SlotStorage::Raw);
+        assert!(tier.raw_fd().is_none());
+        let mut actual = page(0);
+        tier.read(location, &mut actual).expect("read raw fallback");
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn slot_reuse_replaces_compression_metadata() {
+        let temp = TempFilePath::new("compression-reuse");
+        let mut config = buffered_config(1);
+        config.codec = PageCodec::Lz4;
+        let tier = FileTier::open(temp.as_path(), config).expect("open compressed tier");
+
+        let first = tier.write(&page(7)).expect("write compressed page");
+        assert!(matches!(
+            slot_storage(&tier, first),
+            SlotStorage::Envelope { .. }
+        ));
+        tier.free(first);
+        assert_eq!(slot_storage(&tier, first), SlotStorage::Free);
+
+        let expected = pseudo_random_page();
+        let reused = tier.write(&expected).expect("reuse slot with raw page");
+        assert_eq!(reused, first);
+        assert_eq!(slot_storage(&tier, reused), SlotStorage::Raw);
+
+        let mut actual = page(0);
+        tier.read(reused, &mut actual).expect("read reused slot");
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "lz4")]
+    #[test]
+    fn corrupted_compressed_envelope_is_rejected() {
+        const ENVELOPE_HEADER_LEN: u64 = 32;
+
+        let temp = TempFilePath::new("compressed-corruption");
+        let mut config = buffered_config(1);
+        config.codec = PageCodec::Lz4;
+        let tier = FileTier::open(temp.as_path(), config).expect("open compressed tier");
+        let location = tier.write(&page(3)).expect("write compressed page");
+        assert!(matches!(
+            slot_storage(&tier, location),
+            SlotStorage::Envelope { .. }
+        ));
+
+        let backing = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.as_path())
+            .expect("open backing file for corruption");
+        let payload_offset = location.get() + ENVELOPE_HEADER_LEN;
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            backing
+                .read_at(&mut byte, payload_offset)
+                .expect("read payload byte"),
+            1
+        );
+        byte[0] ^= 0x80;
+        assert_eq!(
+            backing
+                .write_at(&byte, payload_offset)
+                .expect("corrupt payload byte"),
+            1
+        );
+
+        let error = tier
+            .read(location, &mut page(0))
+            .expect_err("CRC corruption must fail");
+        assert_eq!(io_kind(error), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn envelope_fit_is_strict_and_direct_io_lengths_round_to_4k() {
+        assert!(envelope_fits_slot(PAGE_SIZE - 1));
+        assert!(!envelope_fits_slot(PAGE_SIZE));
+        assert!(!envelope_fits_slot(PAGE_SIZE + 1));
+
+        assert_eq!(direct_io_len(1).expect("one byte"), 4096);
+        assert_eq!(direct_io_len(4096).expect("one block"), 4096);
+        assert_eq!(direct_io_len(4097).expect("two blocks"), 8192);
+        assert_eq!(
+            direct_io_len(PAGE_SIZE - 1).expect("last fitting length"),
+            PAGE_SIZE
+        );
+        assert_eq!(
+            io_kind(direct_io_len(0).expect_err("zero length")),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            io_kind(direct_io_len(PAGE_SIZE).expect_err("full slot does not fit")),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[cfg(not(feature = "lz4"))]
+    #[test]
+    fn lz4_file_codec_requires_feature() {
+        let temp = TempFilePath::new("lz4-disabled");
+        let mut config = buffered_config(1);
+        config.codec = PageCodec::Lz4;
+
+        let error =
+            FileTier::open(temp.as_path(), config).expect_err("LZ4 feature must be required");
+
+        assert_eq!(io_kind(error), io::ErrorKind::InvalidInput);
+        let mut config = buffered_config(1);
+        config.codec = PageCodec::Lz4;
+        let error =
+            FileTier::open(temp.as_path(), config).expect_err("LZ4 feature must be required");
+        assert!(error.to_string().contains("enable the `lz4` feature"));
     }
 
     #[cfg(not(target_os = "linux"))]

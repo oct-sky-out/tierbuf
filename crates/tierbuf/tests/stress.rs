@@ -32,6 +32,7 @@ fn five_minute_randomized_pressure() {
             epoch: Duration::from_millis(25),
         },
         tiers: vec![Box::new(tier) as Box<dyn TierBackend>],
+        ..BufConfig::default()
     })
     .expect("stress manager");
 

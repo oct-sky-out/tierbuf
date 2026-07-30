@@ -9,4 +9,4 @@ description = "Benchmark harness for tierbuf degradation curves"
 
 [dependencies]
 serde_json.workspace = true
-tierbuf.workspace = true
+tierbuf = { workspace = true, features = ["s3"] }
