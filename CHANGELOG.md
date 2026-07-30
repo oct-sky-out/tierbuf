@@ -6,6 +6,8 @@ All notable changes to tierbuf are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-31
+
 ### Added
 
 - Initial Rust workspace and 64 KiB aligned DRAM frame pool.
@@ -28,3 +30,6 @@ All notable changes to tierbuf are documented here. The format follows
   checkout reservation, exact prefetch markers, and Rust-safe optimistic byte
   access. See
   `docs/design-corrections.md`.
+
+[Unreleased]: https://github.com/oct-sky-out/tierbuf/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/oct-sky-out/tierbuf/releases/tag/v0.1.0
