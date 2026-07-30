@@ -1,6 +1,6 @@
 # tierbuf
 
-**DRAM, NVMe, and future storage tiers managed as one embeddable page space.**
+**DRAM, NVMe, and S3 managed as one embeddable page space.**
 
 **DRAM 가격 위기에 대한 아키텍처적 응답.**
 
@@ -43,18 +43,19 @@ slope rather than a silent performance cliff.
 │                    └───────┬───────┘                          │
 └────────────────────────────┼──────────────────────────────────┘
                              │ TierBackend
-                   ┌─────────┴─────────┐
-                   ▼                   ▼
-              FileTier             MockTier
-          O_DIRECT/buffered     deterministic tests
+             ┌───────────────┬───────────────┐
+             ▼               ▼               ▼
+         FileTier         MockTier         S3Tier
+     O_DIRECT/buffered  deterministic   LZ4 + SigV4 HTTP
 ```
 
 A resident fix follows the tagged `Swip` directly and does not consult the page
 directory. Only an evicted page enters the coalesced fault path and reads its
-recorded lower-tier location. See [Architecture and invariants](docs/architecture.md)
+recorded lower-tier location. See
+[Architecture and invariants](https://github.com/oct-sky-out/tierbuf/blob/main/docs/architecture.md)
 for the state machine, pin/eviction ordering, tier authority, and module map.
 
-## Current v0.1 scope
+## Current v0.2 scope
 
 The kernel includes:
 
@@ -63,17 +64,27 @@ The kernel includes:
 - hybrid shared/exclusive/optimistic latching and closure-scoped byte access;
 - allocation, resident fixes, coalesced lower-tier faults, and a
   page directory that stays off the resident hot path;
-- `FileTier` and deterministic `MockTier` implementations of `TierBackend`,
-  including write-budget and latency metadata;
+- `FileTier`, deterministic `MockTier`, and opt-in `S3Tier` implementations of
+  `TierBackend`, including write-budget, latency, and request-cost metadata;
+- variable-length envelopes for fixed-size pages, with CRC32 and default-on LZ4
+  compression for S3 plus opt-in compressed `FileTier` sub-slot I/O;
+- environment/static/EC2 IMDSv2 credentials, built-in SigV4 signing, retry
+  policy, immutable S3 object IDs, and bounded background DELETE draining;
 - lock-free frame free-list and pin-versus-eviction reservation mechanics;
 - lazy 8.24 fixed-point heat tracking, economic placement decisions, metrics,
   and cost accounting;
 - autonomous cooling, generation-checked eviction, and write-budget fallback;
 - bounded nonblocking prefetch with failure cleanup and generation-exact
   one-shot hit tracking;
-- optional Linux `io_uring` reads (enabled by default) through a dedicated
-  concurrent completion thread, with portable backend fallback;
+- optional Linux `io_uring` reads (enabled by default) for raw file slots
+  through a dedicated concurrent completion thread, with portable backend
+  fallback for compressed file slots;
 - a deterministic degradation-curve harness, checker, and scheduled CI jobs.
+
+See the
+[S3 tier guide](https://github.com/oct-sky-out/tierbuf/blob/main/docs/s3-tier.md)
+for envelope layout, key invariants, economics, concurrency sizing, and
+lifecycle cleanup.
 
 ## Embed in 5 min
 
@@ -95,6 +106,7 @@ fn main() -> tierbuf::Result<()> {
         eviction_mode: EvictionMode::Demand,
         economics: Economics::default(),
         tiers: vec![Box::new(cold) as Box<dyn TierBackend>],
+        ..BufConfig::default()
     })?;
 
     let mut allocated = manager.allocate()?;
@@ -120,6 +132,53 @@ fn main() -> tierbuf::Result<()> {
 guard's latch lifetime. The returned data cannot escape validation or outlive
 its pin.
 
+### Three-tier assembly
+
+Enable `tierbuf`'s `s3` feature, then order lower tiers from fastest to coldest:
+
+```rust,no_run
+use tierbuf::PAGE_SIZE;
+use tierbuf::pool::{BufConfig, BufferManager};
+use tierbuf::tier::TierBackend;
+use tierbuf::tier::file::{FileTier, FileTierConfig};
+use tierbuf::tier::s3::{S3Tier, S3TierConfig};
+use tierbuf::tier::s3::client::S3ClientConfig;
+use tierbuf::tier::s3::credentials::CredentialSource;
+
+fn main() -> tierbuf::Result<()> {
+    let nvme = FileTier::open(
+        "/mnt/nvme/tierbuf.bin",
+        FileTierConfig::new((PAGE_SIZE * 16_384) as u64),
+    )?;
+    let s3 = S3Tier::open(
+        S3ClientConfig {
+            bucket: "my-tierbuf-bucket".to_owned(),
+            region: "us-east-1".to_owned(),
+            credentials: CredentialSource::Auto,
+            ..S3ClientConfig::default()
+        },
+        S3TierConfig {
+            capacity_bytes: (PAGE_SIZE * 524_288) as u64,
+            // Replace UNIQUE-ID for every process or dataset generation.
+            key_prefix: "tierbuf/app-instance-UNIQUE-ID/".to_owned(),
+            ..S3TierConfig::default()
+        },
+    )?;
+    let manager = BufferManager::new(BufConfig {
+        dram_pool_bytes: PAGE_SIZE * 16_384,
+        tiers: vec![
+            Box::new(nvme) as Box<dyn TierBackend>,
+            Box::new(s3) as Box<dyn TierBackend>,
+        ],
+        prefetch_workers: 64,
+        max_prefetch_in_flight: 256,
+        ..BufConfig::default()
+    })?;
+
+    manager.shutdown()
+}
+```
+
 After at least one configured epoch, the cost report renders actual residency
 beside the all-DRAM counterfactual:
 
@@ -136,6 +195,29 @@ cargo run -p tierbuf-bench --release -- --quick
 python3 scripts/degradation.py results/curve.csv --plot results/curve.png
 python3 scripts/visualize_bench.py results/curve.csv --output results/curve.html
 ```
+
+The S3 cliff demo sweeps six DRAM fractions, saves per-run CSV and JSON
+statistics under `results/s3-demo/`, and renders request/compression panels:
+
+```bash
+# Local MinIO scale: 2 GiB dataset, 256 MiB DRAM
+docker run -d --rm -p 9000:9000 --name tierbuf-minio \
+  -e MINIO_ROOT_USER=tierbuf -e MINIO_ROOT_PASSWORD=tierbuf-secret \
+  minio/minio server /data
+export AWS_ACCESS_KEY_ID=tierbuf AWS_SECRET_ACCESS_KEY=tierbuf-secret
+aws --endpoint-url http://127.0.0.1:9000 s3api create-bucket \
+  --bucket tierbuf-demo --region us-east-1
+python3 scripts/s3_cliff_demo.py --local \
+  --endpoint http://127.0.0.1:9000 --bucket tierbuf-demo
+
+# EC2 scale: 32 GiB dataset, 1 GiB DRAM
+python3 scripts/s3_cliff_demo.py --bucket my-bench-bucket \
+  --region us-east-1 --dataset-mib 32768 --dram-mib 1024
+```
+
+The runner prints an estimated request bill and asks for confirmation unless
+`--yes` is supplied. `--compare-prefetch` renders four-worker and 64-worker
+curves side by side.
 
 The checker rejects any adjacent DRAM-fraction pair whose throughput ratio is
 greater than 3.0 or whose p99 ratio is greater than 4.0. Scheduled CI publishes
@@ -202,7 +284,7 @@ behavior for A/B comparisons. The benchmark accepts
 JSON stats artifact records cumulative and measurement-window fixes,
 evictions, second chances, and per-tier I/O.
 
-![tierbuf degradation curve](docs/degradation-curve.svg)
+![tierbuf degradation curve](https://raw.githubusercontent.com/oct-sky-out/tierbuf/main/docs/degradation-curve.svg)
 
 Throughput drops fastest on the very first fault-bearing step (1.0 → 0.8 costs
 about half of full-DRAM throughput) and flattens out well before fraction 0.1;
@@ -238,23 +320,24 @@ The implementation tightens several contracts from the original design plan:
   their completions, with explicit portable fallbacks.
 
 The rationale and exact invariants are recorded in
-[v0.1 safety corrections](docs/design-corrections.md).
+[v0.1 safety corrections](https://github.com/oct-sky-out/tierbuf/blob/main/docs/design-corrections.md).
 
 ## Non-goals
 
-v0.1 is an ephemeral cache/buffer-manager layer, not a database. It does not
+v0.2 is an ephemeral cache/buffer-manager layer, not a database. It does not
 provide crash recovery, WAL, transactions, MVCC, or index structures. The
 latest lower-tier location is authoritative after write-back, but the
 directory itself is not persisted across process restarts.
 
-Variable-size pages, compression, object storage, JVM bindings, and distributed
-cooperative caching are intentionally outside v0.1.
+Variable-size pages, object LIST/recovery, request coalescing, JVM bindings,
+and distributed cooperative caching are outside v0.2.
 
 ## Roadmap
 
-- **v0.1 (current):** fixed-page tiering kernel described above; scheduled CI
-  publishes the first reference degradation curve.
-- **v0.2:** S3/object-storage tiers, variable-size pages, and LZ4-compressed
-  resident pages.
-- **v0.3:** Project Panama bindings for direct JVM/Kotlin/Spark embedding.
+- **v0.1:** fixed-page tiering kernel and reference degradation curve.
+- **v0.2 (current):** S3 object tier, LZ4 S3 envelopes and optional compressed
+  FileTier sub-slots, request-aware economics, and configurable
+  high-concurrency prefetch.
+- **v0.3:** variable-size pages, segmented/range-GET scheduling, and Project
+  Panama bindings for direct JVM/Kotlin/Spark embedding.
 - **v0.4:** distributed cooperative caching with consistent-hash placement.

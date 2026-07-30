@@ -43,10 +43,72 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --all-targets ${{ matrix.feature_args }}
 
+      - name: Run S3 feature tests
+        if: matrix.label == 'default (io_uring)'
+        run: cargo test -p tierbuf --features s3
+
+      - name: Run S3 feature tests without defaults
+        if: matrix.label == 'default (io_uring)'
+        run: cargo test -p tierbuf --no-default-features --features s3
+
+      - name: Run tierbuf without default features
+        if: matrix.label == 'default (io_uring)'
+        run: cargo test -p tierbuf --all-targets --no-default-features
+
+      - name: Run S3 feature Clippy
+        if: matrix.label == 'default (io_uring)'
+        run: cargo clippy -p tierbuf --features s3 --all-targets -- -D warnings
+
       - name: Build documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps ${{ matrix.feature_args }}
+
+  s3-integration:
+    name: S3 integration (MinIO)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TIERBUF_S3_ENDPOINT: http://127.0.0.1:9000
+      TIERBUF_S3_BUCKET: tierbuf-it
+      TIERBUF_S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: tierbuf
+      AWS_SECRET_ACCESS_KEY: tierbuf-secret
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start MinIO
+        run: |
+          docker run -d --rm --name tierbuf-minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=tierbuf \
+            -e MINIO_ROOT_PASSWORD=tierbuf-secret \
+            minio/minio:latest server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs tierbuf-minio
+          exit 1
+
+      - name: Run S3 HTTP integration tests
+        run: cargo test -p tierbuf --features s3 --test s3_integration -- --nocapture
+
+      - name: Show MinIO logs
+        if: failure()
+        run: docker logs tierbuf-minio
+
+      - name: Stop MinIO
+        if: always()
+        run: docker stop tierbuf-minio || true
 
   degradation-script:
     name: Degradation checker tests
@@ -62,7 +124,12 @@ jobs:
           python-version: "3.13"
 
       - name: Run Python unit tests
-        run: python -m unittest scripts/test_degradation.py scripts/test_visualize_bench.py scripts/test_bench_duration_sweep.py
+        run: >-
+          python -m unittest
+          scripts/test_degradation.py
+          scripts/test_visualize_bench.py
+          scripts/test_bench_duration_sweep.py
+          scripts/test_s3_cliff_demo.py
 
   degradation-quick:
     name: Quick degradation curve
