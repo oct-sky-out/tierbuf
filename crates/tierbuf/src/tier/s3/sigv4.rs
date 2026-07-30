@@ -433,16 +433,10 @@ const fn is_unreserved(byte: u8) -> bool {
 
 fn unix_seconds(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => match i64::try_from(duration.as_secs()) {
-            Ok(seconds) => seconds,
-            Err(_) => i64::MAX,
-        },
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         Err(error) => {
             let duration = error.duration();
-            let seconds = match i64::try_from(duration.as_secs()) {
-                Ok(seconds) => seconds,
-                Err(_) => i64::MAX,
-            };
+            let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
             if duration.subsec_nanos() == 0 {
                 seconds.saturating_neg()
             } else {

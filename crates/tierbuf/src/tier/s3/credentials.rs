@@ -18,7 +18,7 @@ const IMDS_TIMEOUT: Duration = Duration::from_secs(1);
 const REFRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// How the S3 tier obtains AWS credentials.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum CredentialSource {
     /// Read `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and the optional
     /// `AWS_SESSION_TOKEN` from the process environment.
@@ -32,13 +32,8 @@ pub enum CredentialSource {
         endpoint: String,
     },
     /// Try the environment first, then EC2 IMDSv2 at the standard endpoint.
+    #[default]
     Auto,
-}
-
-impl Default for CredentialSource {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Clone)]
