@@ -139,8 +139,8 @@ python3 scripts/visualize_bench.py results/curve.csv --output results/curve.html
 
 The checker rejects any adjacent DRAM-fraction pair whose throughput ratio is
 greater than 3.0 or whose p99 ratio is greater than 4.0. Scheduled CI publishes
-the full 4 GiB CSV and graph; this repository keeps a placeholder until a
-reference hardware run is selected.
+the full 4 GiB CSV and graph; the curve below is the first reference hardware
+run (`20260730-164346-i4i-large`, i4i.large, 8192 MiB dataset).
 
 `scripts/visualize_bench.py` renders a dependency-free English HTML dashboard
 from one or more benchmark CSVs. Multiple runs can be compared directly:
@@ -202,7 +202,18 @@ behavior for A/B comparisons. The benchmark accepts
 JSON stats artifact records cumulative and measurement-window fixes,
 evictions, second chances, and per-tier I/O.
 
-![Degradation curve placeholder](docs/degradation-curve-placeholder.svg)
+![tierbuf degradation curve](docs/degradation-curve.svg)
+
+Throughput drops fastest on the very first fault-bearing step (1.0 → 0.8 costs
+about half of full-DRAM throughput) and flattens out well before fraction 0.1;
+p99 latency, by contrast, stays essentially flat from 0.8 down to 0.1 once any
+lower-tier traffic exists at all, because the NVMe device rather than the
+kernel bounds tail latency across that whole range. The third panel checks
+that shape against the shape this repository assumed before any reference
+hardware run existed: the pre-run expectation was a steady, near-linear
+decline to about 18% of peak by fraction 0.1, while the measured curve
+front-loads most of its loss into the 1.0 → 0.8 step (down to 51%, versus an
+assumed 89%) and only converges back toward the pre-run assumption by 0.1.
 
 The ignored release stress can be exercised at its full five-minute duration:
 
