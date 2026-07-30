@@ -9,6 +9,7 @@ use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::atomic::try_update_u64;
 use crate::{Result, TierBufError};
 
 pub mod file;
@@ -150,11 +151,13 @@ impl WriteBudget {
     /// Returns `false` without changing the bucket when insufficient tokens
     /// are available. Consuming zero bytes always succeeds.
     pub fn try_consume(&self, bytes: u64) -> bool {
-        self.available_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                available.checked_sub(bytes)
-            })
-            .is_ok()
+        try_update_u64(
+            &self.available_bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |available| available.checked_sub(bytes),
+        )
+        .is_ok()
     }
 
     /// Advances the deterministic refill clock by `elapsed`.
@@ -200,15 +203,18 @@ impl WriteBudget {
             return;
         }
 
-        let _ =
-            self.available_bytes
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
-                    Some(
-                        available
-                            .saturating_add(added)
-                            .min(self.daily_allowance_bytes),
-                    )
-                });
+        let _ = try_update_u64(
+            &self.available_bytes,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |available| {
+                Some(
+                    available
+                        .saturating_add(added)
+                        .min(self.daily_allowance_bytes),
+                )
+            },
+        );
     }
 
     /// Returns the maximum number of tokens held by the bucket.

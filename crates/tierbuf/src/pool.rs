@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::atomic::{try_update_u64, try_update_usize};
 use crate::cooling::{CoolingQueue, CoolingTicket};
 use crate::frame::{Frame, FrameTable};
 use crate::latch::{ExclusiveRaw, SharedRaw};
@@ -882,12 +883,13 @@ impl BufferManager {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
-            if self
-                .prefetch_in_flight
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    (current < MAX_PREFETCH_IN_FLIGHT).then_some(current + 1)
-                })
-                .is_err()
+            if try_update_usize(
+                &self.prefetch_in_flight,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |current| (current < MAX_PREFETCH_IN_FLIGHT).then_some(current + 1),
+            )
+            .is_err()
             {
                 self.prefetch_pending
                     .lock()
@@ -1549,14 +1551,15 @@ impl BufferManager {
     }
 
     fn allocate_pid(&self) -> Result<PageId> {
-        let raw = self
-            .next_pid
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                (current <= PageId::MAX).then_some(current + 1)
-            })
-            .map_err(|_| {
-                TierBufError::InvalidConfig("logical page identifier space exhausted".into())
-            })?;
+        let raw = try_update_u64(
+            &self.next_pid,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| (current <= PageId::MAX).then_some(current + 1),
+        )
+        .map_err(|_| {
+            TierBufError::InvalidConfig("logical page identifier space exhausted".into())
+        })?;
         PageId::new(raw).ok_or(TierBufError::InvalidPid(raw))
     }
 
@@ -2187,11 +2190,13 @@ fn validate_config(config: &BufConfig) -> Result<()> {
 }
 
 fn allocate_manager_id() -> Result<u64> {
-    NEXT_MANAGER_ID
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            current.checked_add(1)
-        })
-        .map_err(|_| TierBufError::InvalidConfig("buffer-manager identity space exhausted".into()))
+    try_update_u64(
+        &NEXT_MANAGER_ID,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+        |current| current.checked_add(1),
+    )
+    .map_err(|_| TierBufError::InvalidConfig("buffer-manager identity space exhausted".into()))
 }
 
 #[cfg(test)]

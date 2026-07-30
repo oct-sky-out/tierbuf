@@ -3,6 +3,7 @@
 #[cfg(miri)]
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::io;
+#[cfg(not(miri))]
 use std::ptr;
 #[cfg(miri)]
 use std::ptr::NonNull;
