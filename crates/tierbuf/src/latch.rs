@@ -446,7 +446,10 @@ mod tests {
 
     #[test]
     fn optimistic_readers_observe_writer_versions_without_panicking() {
+        #[cfg(not(miri))]
         const WRITES: u64 = 50_000;
+        #[cfg(miri)]
+        const WRITES: u64 = 100;
         const READERS: usize = 4;
 
         let latch = Arc::new(HybridLatch::new());
