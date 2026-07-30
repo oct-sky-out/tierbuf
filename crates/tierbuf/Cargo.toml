@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license-file = "../../LICENSE"
+repository.workspace = true
 description = "A tier-aware buffer manager for DRAM and lower storage tiers"
 readme = "../../README.md"
 documentation = "https://docs.rs/tierbuf"
