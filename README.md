@@ -223,6 +223,25 @@ The runner prints an estimated request bill and asks for confirmation unless
 `--yes` is supplied. `--compare-prefetch` renders four-worker and 64-worker
 curves side by side.
 
+### FileTier compression crossover
+
+Fixed 64 KiB slots mean LZ4 never adds file-tier capacity, and enabling it
+costs the `io_uring` read path because a compressing tier withholds its raw
+descriptor. Whether the saved bytes repay that depends on the data, so the
+trade is measured rather than assumed:
+
+```bash
+python3 scripts/file_compression_demo.py \
+  --tier-path /mnt/nvme/tier/tierbuf-compression.bin \
+  --dataset-mib 8192 --fraction 0.25
+```
+
+The sweep runs `--file-compression off` and `on` across
+`--payload-compressibility` values and reports the compressibility at which the
+two throughputs break even, writing `crossover.csv` beside the per-run
+artifacts. Set `BENCH_FILE_COMPRESSION_DEMO=1` in `infra/aws-bench/bench.env`
+to run it on real EC2 NVMe, where the `io_uring` path is actually available.
+
 The checker rejects any adjacent DRAM-fraction pair whose throughput ratio is
 greater than 3.0 or whose p99 ratio is greater than 4.0. Scheduled CI publishes
 the full 4 GiB CSV and graph; the curve below is the first reference hardware

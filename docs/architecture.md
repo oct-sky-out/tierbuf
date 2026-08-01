@@ -189,6 +189,14 @@ Capacity, `used_bytes`, and write-budget consumption remain conservative
 fixed-page accounting, so compression reduces transfer bytes rather than
 increasing logical capacity.
 
+Because compression trades the `io_uring` path for fewer transferred bytes,
+whether it is worth enabling depends on how compressible the data actually is.
+`scripts/file_compression_demo.py` measures that trade directly: it sweeps
+`tierbuf-bench --payload-compressibility` with `--file-compression off` and
+`on`, then reports the compressibility at which the two throughputs break even.
+Below that point the lost `io_uring` submission path costs more than the saved
+bytes; above it compression wins.
+
 ## Policy and time
 
 Heat is an unsigned 8.24 fixed-point value packed with its last epoch in one

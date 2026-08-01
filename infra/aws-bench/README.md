@@ -18,8 +18,9 @@ builds use the same compiler as development and stable CI jobs.
   group.
 - `run-bench.sh`: launches one Spot instance and polls S3 completion markers.
 - `user-data.sh.tpl`: unattended EC2 boot workflow.
-- `fetch-results.sh`: downloads artifacts into `results/cloud/<run-id>/` and
-  copies S3 demo artifacts to `results/s3-demo/cloud/<run-id>/`.
+- `fetch-results.sh`: downloads artifacts into `results/cloud/<run-id>/`,
+  copies S3 demo artifacts to `results/s3-demo/cloud/<run-id>/`, and copies
+  compression sweeps to `results/file-compression/cloud/<run-id>/`.
 
 ## Prerequisites
 
@@ -42,6 +43,12 @@ builds use the same compiler as development and stable CI jobs.
    Set `INSTANCE_TYPE=i4i.2xlarge` (64 GiB) or a larger-memory instance and
    `MAX_MINUTES` to at least 180. The launcher checks both before spending
    money. Leaving `BENCH_S3_BUCKET` empty runs only the existing NVMe benchmark.
+5. To enable the FileTier compression crossover sweep, set
+   `BENCH_FILE_COMPRESSION_DEMO=1`. It uses only the instance NVMe and adds no
+   S3 charges, but it does add runtime: two benchmarks per entry in
+   `BENCH_FILE_COMPRESSION_PCTS`. With the shipped six percentages and the
+   default 10s warmup plus 30s measurement, budget about 30 extra minutes
+   including dataset loading, and raise `MAX_MINUTES` accordingly.
 
 The harness currently has fixed DRAM fractions of 1.0, 0.8, 0.6, 0.4, 0.2,
 and 0.1. Its supported sizing flags use MiB, so the supplied default is
@@ -63,6 +70,16 @@ either `_DONE` or `_FAILED`, and then terminates. Resume result retrieval with
 `fetch-results.sh`. When enabled, the S3 demo runs after the NVMe curve with
 `scripts/s3_cliff_demo.py --yes`; its CSV, stats JSON, and dashboard are
 uploaded below `results/<run-id>/s3-demo/`.
+
+When `BENCH_FILE_COMPRESSION_DEMO` is set, `scripts/file_compression_demo.py`
+runs before the S3 demo and uploads per-run CSV and stats JSON plus
+`crossover.csv` below `results/<run-id>/file-compression/`, with the printed
+table saved as `results/<run-id>/file-compression-summary.txt`. The sweep
+answers whether LZ4 slot compression is worth losing the io_uring read path
+on this instance's NVMe: it reports the payload compressibility at which
+compression-on throughput overtakes compression-off throughput. Fixed 64 KiB
+slots mean compression never adds capacity, so throughput and endurance are
+the only things being traded.
 
 ## Security and cost
 
