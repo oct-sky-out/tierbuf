@@ -33,9 +33,14 @@ DEFAULT_FRACTION = "0.25"
 DEFAULT_WARMUP_SECS = 5.0
 DEFAULT_MEASURE_SECS = 30.0
 DEFAULT_WORKERS = 4
+PAYLOAD_SHAPES = ("uniform", "chunked")
+DEFAULT_PAYLOAD_SHAPE = "uniform"
+DEFAULT_PAYLOAD_SPREAD = 0
 SUMMARY_HEADER = (
     "compressibility_pct",
     "sampled_compression_ratio",
+    "sampled_compression_ratio_min",
+    "sampled_compression_ratio_max",
     "throughput_off_ops",
     "throughput_on_ops",
     "speedup",
@@ -54,6 +59,8 @@ class DemoConfig:
     dataset_mib: int
     fraction: str
     percentages: tuple[int, ...]
+    payload_shape: str
+    payload_spread: int
     warmup_secs: float
     measure_secs: float
     workers: int
@@ -68,6 +75,8 @@ class VariantResult:
 
     compressibility_pct: int
     sampled_compression_ratio: float | None
+    sampled_compression_ratio_min: float | None
+    sampled_compression_ratio_max: float | None
     throughput_off: float
     throughput_on: float
 
@@ -160,8 +169,12 @@ def build_benchmark_command(
         str(config.tier_path),
         "--file-compression",
         mode,
+        "--payload-shape",
+        config.payload_shape,
         "--payload-compressibility",
         str(compressibility_pct),
+        "--payload-spread",
+        str(config.payload_spread),
         "--output",
         str(csv_path),
         "--stats-output",
@@ -205,8 +218,8 @@ def read_throughput(path: Path) -> float:
     return throughput
 
 
-def read_sampled_ratio(path: Path) -> float | None:
-    """Return the sampled LZ4 envelope ratio recorded in a benchmark stats file."""
+def read_sampled_ratios(path: Path) -> tuple[float | None, float | None, float | None]:
+    """Return the mean, minimum, and maximum sampled LZ4 envelope ratios."""
 
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -223,12 +236,19 @@ def read_sampled_ratio(path: Path) -> float | None:
     if not isinstance(descriptor, dict):
         raise DemoDataError(f"{path}: stats JSON run has no payload descriptor")
 
-    ratio = descriptor.get("sampled_compression_ratio")
-    if ratio is None:
-        return None
-    if not isinstance(ratio, (int, float)) or isinstance(ratio, bool):
-        raise DemoDataError(f"{path}: sampled_compression_ratio must be a number")
-    return float(ratio)
+    def ratio(field: str) -> float | None:
+        value = descriptor.get(field)
+        if value is None:
+            return None
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise DemoDataError(f"{path}: {field} must be a number")
+        return float(value)
+
+    return (
+        ratio("sampled_compression_ratio"),
+        ratio("sampled_compression_ratio_min"),
+        ratio("sampled_compression_ratio_max"),
+    )
 
 
 def crossover_point(results: Sequence[VariantResult]) -> Crossover:
@@ -264,9 +284,9 @@ def format_summary_table(results: Sequence[VariantResult]) -> str:
     """Return a fixed-width table of the sweep for terminal output."""
 
     lines = [
-        f"{'payload%':>8}  {'lz4 ratio':>9}  {'off ops/s':>12}  "
-        f"{'on ops/s':>12}  {'speedup':>8}",
-        f"{'-' * 8}  {'-' * 9}  {'-' * 12}  {'-' * 12}  {'-' * 8}",
+        f"{'payload%':>8}  {'lz4 ratio':>9}  {'ratio range':>17}  "
+        f"{'off ops/s':>12}  {'on ops/s':>12}  {'speedup':>8}",
+        f"{'-' * 8}  {'-' * 9}  {'-' * 17}  {'-' * 12}  {'-' * 12}  {'-' * 8}",
     ]
     for result in sorted(results, key=lambda item: item.compressibility_pct):
         ratio = (
@@ -274,8 +294,11 @@ def format_summary_table(results: Sequence[VariantResult]) -> str:
             if result.sampled_compression_ratio is None
             else f"{result.sampled_compression_ratio:.4f}"
         )
+        low = result.sampled_compression_ratio_min
+        high = result.sampled_compression_ratio_max
+        span = "n/a" if low is None or high is None else f"{low:.4f}-{high:.4f}"
         lines.append(
-            f"{result.compressibility_pct:>8}  {ratio:>9}  "
+            f"{result.compressibility_pct:>8}  {ratio:>9}  {span:>17}  "
             f"{result.throughput_off:>12,.0f}  {result.throughput_on:>12,.0f}  "
             f"{result.speedup:>8.3f}"
         )
@@ -290,11 +313,16 @@ def write_summary_csv(results: Sequence[VariantResult], output: Path) -> None:
             writer = csv.writer(destination, lineterminator="\n")
             writer.writerow(SUMMARY_HEADER)
             for result in sorted(results, key=lambda item: item.compressibility_pct):
-                ratio = result.sampled_compression_ratio
+
+                def cell(value: float | None) -> str:
+                    return "" if value is None else f"{value:.6f}"
+
                 writer.writerow(
                     [
                         result.compressibility_pct,
-                        "" if ratio is None else f"{ratio:.6f}",
+                        cell(result.sampled_compression_ratio),
+                        cell(result.sampled_compression_ratio_min),
+                        cell(result.sampled_compression_ratio_max),
                         f"{result.throughput_off:.3f}",
                         f"{result.throughput_on:.3f}",
                         f"{result.speedup:.6f}",
@@ -310,7 +338,7 @@ def run_sweep(config: DemoConfig) -> list[VariantResult]:
     results: list[VariantResult] = []
     for compressibility_pct in config.percentages:
         throughputs: dict[str, float] = {}
-        ratio: float | None = None
+        ratios: tuple[float | None, float | None, float | None] = (None, None, None)
         for mode in COMPRESSION_MODES:
             stem = variant_stem(mode, compressibility_pct)
             csv_path = config.output_dir / f"{stem}.csv"
@@ -325,14 +353,16 @@ def run_sweep(config: DemoConfig) -> list[VariantResult]:
                 continue
             throughputs[mode] = read_throughput(csv_path)
             if mode == "on":
-                ratio = read_sampled_ratio(stats_path)
+                ratios = read_sampled_ratios(stats_path)
 
         if config.dry_run:
             continue
         results.append(
             VariantResult(
                 compressibility_pct=compressibility_pct,
-                sampled_compression_ratio=ratio,
+                sampled_compression_ratio=ratios[0],
+                sampled_compression_ratio_min=ratios[1],
+                sampled_compression_ratio_max=ratios[2],
                 throughput_off=throughputs["off"],
                 throughput_on=throughputs["on"],
             )
@@ -376,6 +406,25 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Comma-separated payload compressibility percentages "
             f"(default: {','.join(str(value) for value in COMPRESSIBILITY_PCTS)})"
+        ),
+    )
+    parser.add_argument(
+        "--payload-shape",
+        choices=PAYLOAD_SHAPES,
+        default=DEFAULT_PAYLOAD_SHAPE,
+        help=(
+            "Page structure: 'uniform' gives every page one zero prefix, "
+            "'chunked' emits variable-length runs "
+            f"(default: {DEFAULT_PAYLOAD_SHAPE})"
+        ),
+    )
+    parser.add_argument(
+        "--payload-spread",
+        type=int,
+        default=DEFAULT_PAYLOAD_SPREAD,
+        help=(
+            "Per-page compressibility variation around each target, so one "
+            f"dataset holds a distribution (default: {DEFAULT_PAYLOAD_SPREAD})"
         ),
     )
     parser.add_argument(
@@ -429,6 +478,8 @@ def config_from_args(args: argparse.Namespace) -> DemoConfig:
         raise DemoDataError("--workers must be greater than zero")
     if not str(args.tier_path):
         raise DemoDataError("--tier-path must not be empty")
+    if not 0 <= args.payload_spread <= 100:
+        raise DemoDataError("--payload-spread must be within 0..=100")
 
     output_dir = args.output_dir
     summary = args.summary if args.summary is not None else output_dir / DEFAULT_SUMMARY_NAME
@@ -437,6 +488,8 @@ def config_from_args(args: argparse.Namespace) -> DemoConfig:
         dataset_mib=args.dataset_mib,
         fraction=args.fraction,
         percentages=tuple(args.compressibility),
+        payload_shape=args.payload_shape,
+        payload_spread=args.payload_spread,
         warmup_secs=args.warmup_secs,
         measure_secs=args.measure_secs,
         workers=args.workers,
@@ -483,6 +536,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"FileTier compression sweep: dataset {config.dataset_mib} MiB, "
         f"DRAM fraction {config.fraction}, tier {config.tier_path}"
+    )
+    print(
+        f"Payload: shape {config.payload_shape}, "
+        f"per-page spread +/-{config.payload_spread}%"
     )
     print(format_summary_table(results))
     print()

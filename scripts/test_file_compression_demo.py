@@ -21,12 +21,16 @@ def variant(
     throughput_off: float,
     throughput_on: float,
     ratio: float | None = None,
+    ratio_min: float | None = None,
+    ratio_max: float | None = None,
 ) -> demo.VariantResult:
     """Build one measured sweep point for crossover assertions."""
 
     return demo.VariantResult(
         compressibility_pct=compressibility_pct,
         sampled_compression_ratio=ratio,
+        sampled_compression_ratio_min=ratio if ratio_min is None else ratio_min,
+        sampled_compression_ratio_max=ratio if ratio_max is None else ratio_max,
         throughput_off=throughput_off,
         throughput_on=throughput_on,
     )
@@ -45,6 +49,8 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(config.fraction, demo.DEFAULT_FRACTION)
         self.assertEqual(config.percentages, demo.COMPRESSIBILITY_PCTS)
         self.assertEqual(config.summary, demo.DEFAULT_OUTPUT_DIR / "crossover.csv")
+        self.assertEqual(config.payload_shape, demo.DEFAULT_PAYLOAD_SHAPE)
+        self.assertEqual(config.payload_spread, demo.DEFAULT_PAYLOAD_SPREAD)
         self.assertFalse(config.dry_run)
 
     def test_overrides_are_applied(self) -> None:
@@ -61,6 +67,10 @@ class ArgumentTests(unittest.TestCase):
             "2.5",
             "--output-dir",
             "results/custom",
+            "--payload-shape",
+            "chunked",
+            "--payload-spread",
+            "30",
             "--dry-run",
         )
 
@@ -70,6 +80,8 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(config.percentages, (0, 50, 100))
         self.assertEqual(config.measure_secs, 2.5)
         self.assertEqual(config.summary, Path("results/custom/crossover.csv"))
+        self.assertEqual(config.payload_shape, "chunked")
+        self.assertEqual(config.payload_spread, 30)
         self.assertTrue(config.dry_run)
 
     def test_compressibility_list_is_validated(self) -> None:
@@ -86,6 +98,8 @@ class ArgumentTests(unittest.TestCase):
             ("--measure-secs", "0"),
             ("--warmup-secs", "-1"),
             ("--workers", "0"),
+            ("--payload-spread", "101"),
+            ("--payload-spread", "-1"),
         ]:
             with self.subTest(arguments=arguments):
                 with self.assertRaises(demo.DemoDataError):
@@ -99,6 +113,8 @@ class CommandTests(unittest.TestCase):
             dataset_mib=256,
             fraction="0.25",
             percentages=(0, 100),
+            payload_shape="uniform",
+            payload_spread=0,
             warmup_secs=1.0,
             measure_secs=5.0,
             workers=4,
@@ -129,6 +145,20 @@ class CommandTests(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--fraction") + 1], "0.25")
         self.assertEqual(command[command.index("--output") + 1], "results/x.csv")
+        self.assertEqual(command[command.index("--payload-shape") + 1], "uniform")
+        self.assertEqual(command[command.index("--payload-spread") + 1], "0")
+
+    def test_command_forwards_the_selected_shape_and_spread(self) -> None:
+        command = demo.build_benchmark_command(
+            self.config(payload_shape="chunked", payload_spread=30),
+            "on",
+            50,
+            Path("results/x.csv"),
+            Path("results/x.json"),
+        )
+
+        self.assertEqual(command[command.index("--payload-shape") + 1], "chunked")
+        self.assertEqual(command[command.index("--payload-spread") + 1], "30")
 
     def test_unknown_mode_is_rejected(self) -> None:
         with self.assertRaises(demo.DemoDataError):
@@ -183,6 +213,8 @@ class ArtifactTests(unittest.TestCase):
                                     "compressibility_pct": 50,
                                     "file_compression": True,
                                     "sampled_compression_ratio": 0.51,
+                                    "sampled_compression_ratio_min": 0.22,
+                                    "sampled_compression_ratio_max": 0.77,
                                 }
                             }
                         ]
@@ -192,7 +224,9 @@ class ArtifactTests(unittest.TestCase):
             )
 
             self.assertEqual(demo.read_throughput(csv_path), 1234.5)
-            self.assertEqual(demo.read_sampled_ratio(stats_path), 0.51)
+            self.assertEqual(
+                demo.read_sampled_ratios(stats_path), (0.51, 0.22, 0.77)
+            )
 
     def test_missing_ratio_is_reported_as_none(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -202,7 +236,9 @@ class ArtifactTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.assertIsNone(demo.read_sampled_ratio(stats_path))
+            self.assertEqual(
+                demo.read_sampled_ratios(stats_path), (None, None, None)
+            )
 
     def test_malformed_artifacts_are_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -223,14 +259,14 @@ class ArtifactTests(unittest.TestCase):
             with self.assertRaises(demo.DemoDataError):
                 demo.read_throughput(zero)
             with self.assertRaises(demo.DemoDataError):
-                demo.read_sampled_ratio(no_runs)
+                demo.read_sampled_ratios(no_runs)
             with self.assertRaises(demo.DemoDataError):
-                demo.read_sampled_ratio(no_payload)
+                demo.read_sampled_ratios(no_payload)
 
     def test_summary_csv_round_trips(self) -> None:
         results = [
             variant(0, 1000.0, 800.0, ratio=1.0005),
-            variant(100, 1000.0, 1500.0, ratio=0.0046),
+            variant(100, 1000.0, 1500.0, ratio=0.0046, ratio_min=0.001, ratio_max=0.02),
         ]
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "crossover.csv"
@@ -238,7 +274,10 @@ class ArtifactTests(unittest.TestCase):
             lines = output.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(lines[0], ",".join(demo.SUMMARY_HEADER))
-        self.assertTrue(lines[1].startswith("0,1.000500,1000.000,800.000,0.800000"))
+        self.assertTrue(
+            lines[1].startswith("0,1.000500,1.000500,1.000500,1000.000,800.000,0.800000")
+        )
+        self.assertIn("0.001000,0.020000", lines[2])
         self.assertEqual(len(lines), 3)
 
 
