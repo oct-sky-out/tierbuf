@@ -37,6 +37,20 @@ if ! [[ "${MAX_MINUTES}" =~ ^[1-9][0-9]*$ ]]; then
   echo "bench.env: MAX_MINUTES must be a positive integer" >&2
   exit 2
 fi
+if [ -n "${BENCH_FILE_COMPRESSION_DEMO:-}" ]; then
+  for name in BENCH_FILE_COMPRESSION_PCTS BENCH_FILE_COMPRESSION_DATASET_MIB \
+    BENCH_FILE_COMPRESSION_FRACTION; do
+    require_value "${name}"
+  done
+  if ! [[ "${BENCH_FILE_COMPRESSION_PCTS}" =~ ^[0-9]+(,[0-9]+)+$ ]]; then
+    echo "bench.env: BENCH_FILE_COMPRESSION_PCTS must be a comma-separated list of at least two percentages" >&2
+    exit 2
+  fi
+  if ! [[ "${BENCH_FILE_COMPRESSION_DATASET_MIB}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "bench.env: BENCH_FILE_COMPRESSION_DATASET_MIB must be a positive integer" >&2
+    exit 2
+  fi
+fi
 if [ -n "${BENCH_S3_BUCKET:-}" ]; then
   INSTANCE_MEMORY_MIB=$(aws ec2 describe-instance-types --region "${REGION}" \
     --instance-types "${INSTANCE_TYPE}" \
@@ -85,6 +99,10 @@ sed -e "s|__RUN_ID_B64__|$(encode "${RUN_ID}")|g" \
   -e "s|__REPO_URL_B64__|$(encode "${REPO_URL}")|g" \
   -e "s|__REPO_BRANCH_B64__|$(encode "${REPO_BRANCH}")|g" \
   -e "s|__BENCH_ARGS_B64__|$(encode "${BENCH_ARGS}")|g" \
+  -e "s|__FILE_COMPRESSION_DEMO_B64__|$(encode "${BENCH_FILE_COMPRESSION_DEMO:-}")|g" \
+  -e "s|__FILE_COMPRESSION_PCTS_B64__|$(encode "${BENCH_FILE_COMPRESSION_PCTS:-}")|g" \
+  -e "s|__FILE_COMPRESSION_DATASET_MIB_B64__|$(encode "${BENCH_FILE_COMPRESSION_DATASET_MIB:-}")|g" \
+  -e "s|__FILE_COMPRESSION_FRACTION_B64__|$(encode "${BENCH_FILE_COMPRESSION_FRACTION:-}")|g" \
   -e "s|__MAX_MINUTES__|${MAX_MINUTES}|g" \
   "${SCRIPT_DIR}/user-data.sh.tpl" > "${UD_FILE}"
 

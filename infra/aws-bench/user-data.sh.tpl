@@ -14,6 +14,10 @@ BENCH_S3_REGION=$(decode "__BENCH_S3_REGION_B64__")
 REPO_URL=$(decode "__REPO_URL_B64__")
 REPO_BRANCH=$(decode "__REPO_BRANCH_B64__")
 BENCH_ARGS=$(decode "__BENCH_ARGS_B64__")
+FILE_COMPRESSION_DEMO=$(decode "__FILE_COMPRESSION_DEMO_B64__")
+FILE_COMPRESSION_PCTS=$(decode "__FILE_COMPRESSION_PCTS_B64__")
+FILE_COMPRESSION_DATASET_MIB=$(decode "__FILE_COMPRESSION_DATASET_MIB_B64__")
+FILE_COMPRESSION_FRACTION=$(decode "__FILE_COMPRESSION_FRACTION_B64__")
 MAX_MINUTES="__MAX_MINUTES__"
 BENCH_SUCCEEDED=0
 
@@ -87,6 +91,18 @@ mkdir -p /tmp/results /mnt/nvme/tier
   --file-tier /mnt/nvme/tier/tierbuf.bin \
   --output /tmp/results/curve.csv
 
+if [ -n "${FILE_COMPRESSION_DEMO}" ]; then
+  # NVMe-only sweep. Compression withholds the raw descriptor, so this compares
+  # the io_uring raw-slot path against synchronous LZ4 slot reads on real NVMe.
+  python3 scripts/file_compression_demo.py \
+    --tier-path /mnt/nvme/tier/tierbuf-compression.bin \
+    --dataset-mib "${FILE_COMPRESSION_DATASET_MIB}" \
+    --fraction "${FILE_COMPRESSION_FRACTION}" \
+    --compressibility "${FILE_COMPRESSION_PCTS}" \
+    --output-dir /tmp/results/file-compression \
+    | tee /tmp/results/file-compression-summary.txt
+fi
+
 if [ -n "${BENCH_S3_BUCKET}" ]; then
   python3 scripts/s3_cliff_demo.py --yes \
     --bucket "${BENCH_S3_BUCKET}" \
@@ -112,6 +128,10 @@ metadata() {
   echo "bench_args=${BENCH_ARGS}"
   echo "bench_s3_bucket=${BENCH_S3_BUCKET}"
   echo "bench_s3_region=${BENCH_S3_REGION}"
+  echo "file_compression_demo=${FILE_COMPRESSION_DEMO}"
+  echo "file_compression_pcts=${FILE_COMPRESSION_PCTS}"
+  echo "file_compression_dataset_mib=${FILE_COMPRESSION_DATASET_MIB}"
+  echo "file_compression_fraction=${FILE_COMPRESSION_FRACTION}"
 } > /tmp/results/meta.txt
 
 BENCH_SUCCEEDED=1
