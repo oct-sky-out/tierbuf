@@ -1,36 +1,28 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-macro_rules! define_try_update {
-    ($name:ident, $atomic:ty, $value:ty) => {
-        pub(crate) fn $name<F>(
-            atomic: &$atomic,
-            set_order: Ordering,
-            fetch_order: Ordering,
-            mut update: F,
-        ) -> Result<$value, $value>
-        where
-            F: FnMut($value) -> Option<$value>,
-        {
-            let mut current = atomic.load(fetch_order);
-            loop {
-                let Some(next) = update(current) else {
-                    return Err(current);
-                };
-                match atomic.compare_exchange_weak(current, next, set_order, fetch_order) {
-                    Ok(previous) => return Ok(previous),
-                    Err(observed) => current = observed,
-                }
-            }
-        }
-    };
+pub(crate) fn try_update_u64<F>(
+    atomic: &AtomicU64,
+    set_order: Ordering,
+    fetch_order: Ordering,
+    update: F,
+) -> Result<u64, u64>
+where
+    F: FnMut(u64) -> Option<u64>,
+{
+    atomic.try_update(set_order, fetch_order, update)
 }
 
-// `Atomic*::fetch_update` is deprecated on current nightly Rust in favor of
-// `try_update`, but the replacement is not available on tierbuf's Rust 1.88
-// MSRV. These helpers preserve the operation without suppressing warnings or
-// requiring a newer compiler.
-define_try_update!(try_update_u64, AtomicU64, u64);
-define_try_update!(try_update_usize, AtomicUsize, usize);
+pub(crate) fn try_update_usize<F>(
+    atomic: &AtomicUsize,
+    set_order: Ordering,
+    fetch_order: Ordering,
+    update: F,
+) -> Result<usize, usize>
+where
+    F: FnMut(usize) -> Option<usize>,
+{
+    atomic.try_update(set_order, fetch_order, update)
+}
 
 #[cfg(test)]
 mod tests {

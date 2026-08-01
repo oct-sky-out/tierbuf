@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Rust 2024 workspace (minimum Rust 1.88) with two crates:
+This is a Rust 2024 workspace pinned to Rust 1.97.1 with two crates:
 
 - `crates/tierbuf/`: the embeddable buffer-manager library. Core modules live in `src/`; integration and property tests are in `tests/`; Criterion benchmarks are in `benches/`.
 - `crates/tierbuf-bench/`: the degradation-curve command-line harness.

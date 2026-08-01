@@ -6,6 +6,11 @@ All notable changes to tierbuf are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the workspace Rust requirement from 1.88 to 1.97.1 and pinned local
+  development, stable CI jobs, and AWS benchmark builds to that exact release.
+
 ## [0.2.0] - 2026-07-31
 
 ### Added

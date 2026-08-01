@@ -6,6 +6,9 @@ to S3, and terminates itself. It can also run the 32 GiB S3 cliff demo against a
 separate benchmark-data bucket. A scheduled shutdown bounds the maximum runtime
 even if provisioning or the benchmark hangs.
 
+The instance installs the repository's pinned Rust 1.97.1 toolchain so benchmark
+builds use the same compiler as development and stable CI jobs.
+
 ## Layout
 
 - `bench.env.example`: versioned configuration template.

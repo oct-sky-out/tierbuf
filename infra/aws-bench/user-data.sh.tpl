@@ -71,7 +71,7 @@ fio --name=baseline --filename=/mnt/nvme/fio.test --rw=randread --bs=64k \
 rm -f /mnt/nvme/fio.test
 
 curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
-  --default-toolchain 1.88.0
+  --default-toolchain 1.97.1
 # shellcheck source=/dev/null
 source /root/.cargo/env
 

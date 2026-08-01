@@ -9,6 +9,10 @@ aligned DRAM frames, and explicit lower storage tiers. It gives storage engines
 a small mechanism layer they can embed instead of coupling them to an async
 runtime or a complete database.
 
+The workspace requires and pins Rust 1.97.1 for development, CI, and
+reproducible AWS benchmark builds. Miri checks use nightly because Miri is not
+distributed with the stable toolchain.
+
 DRAM capacity is increasingly an economic constraint, not just a hardware
 sizing choice. Hot data keeps the direct-access path it deserves, while colder
 data can move to less expensive media without splitting the application's
