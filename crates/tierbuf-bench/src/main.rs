@@ -45,6 +45,15 @@ const DEFAULT_S3_REGION: &str = "us-east-1";
 /// this option existed remain directly comparable.
 const DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT: u8 = 100;
 const PAYLOAD_SEED_SALT: u64 = 0x510e_527f_ade6_82d1;
+const PAYLOAD_SPREAD_SALT: u64 = 0x9b05_688c_2b3e_6c1f;
+const PAYLOAD_CHUNK_SALT: u64 = 0x1f83_d9ab_fb41_bd6b;
+/// Shortest and longest run emitted by the chunked payload shape.
+const PAYLOAD_MIN_RUN: usize = 64;
+const PAYLOAD_MAX_RUN: usize = 8 * 1024;
+/// Longest repeated token used inside one compressible run.
+const PAYLOAD_MAX_TOKEN: usize = 16;
+/// Pages encoded when reporting the achieved compression ratio.
+const PAYLOAD_SAMPLE_PAGES: usize = 64;
 const DEFAULT_OUTPUT: &str = "results/curve.csv";
 const DEFAULT_STATS_OUTPUT: &str = "results/stats.json";
 const ECONOMIC_EPOCH: Duration = Duration::from_millis(100);
@@ -145,13 +154,13 @@ fn run_fraction(
                 &manager,
                 layout.page_count,
                 DEFAULT_S3_PREFETCH_WORKERS,
-                config.payload_compressibility_pct,
+                PayloadDescriptor::from_config(config),
             )?
         } else {
             initialize_dataset(
                 &manager,
                 layout.page_count,
-                config.payload_compressibility_pct,
+                PayloadDescriptor::from_config(config),
             )?
         };
         let swips: Arc<[Swip]> = initialized.into();
@@ -307,24 +316,50 @@ fn fraction_stats_json(
 /// Payload and file-tier codec settings recorded alongside one measurement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PayloadDescriptor {
+    shape: PayloadShape,
     compressibility_pct: u8,
+    spread_pct: u8,
     file_compression: bool,
+}
+
+impl Default for PayloadDescriptor {
+    fn default() -> Self {
+        Self {
+            shape: PayloadShape::Uniform,
+            compressibility_pct: DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
+            spread_pct: 0,
+            file_compression: false,
+        }
+    }
 }
 
 impl PayloadDescriptor {
     fn from_config(config: &Config) -> Self {
         Self {
+            shape: config.payload_shape,
             compressibility_pct: config.payload_compressibility_pct,
+            spread_pct: config.payload_spread_pct,
             file_compression: config.file_compression,
         }
     }
 }
 
 fn payload_json(payload: PayloadDescriptor) -> Value {
+    let sample = sampled_compression(
+        payload.shape,
+        payload.compressibility_pct,
+        payload.spread_pct,
+        PAYLOAD_SAMPLE_PAGES,
+    );
     json!({
+        "shape": payload.shape.label(),
         "compressibility_pct": payload.compressibility_pct,
+        "spread_pct": payload.spread_pct,
         "file_compression": payload.file_compression,
-        "sampled_compression_ratio": sampled_compression_ratio(payload.compressibility_pct),
+        "sampled_pages": sample.map(|sample| sample.pages),
+        "sampled_compression_ratio": sample.map(|sample| sample.mean),
+        "sampled_compression_ratio_min": sample.map(|sample| sample.min),
+        "sampled_compression_ratio_max": sample.map(|sample| sample.max),
     })
 }
 
@@ -640,7 +675,7 @@ fn make_manager(
 fn initialize_dataset(
     manager: &Arc<BufferManager>,
     page_count: usize,
-    compressibility_pct: u8,
+    payload: PayloadDescriptor,
 ) -> Result<Vec<Swip>, String> {
     let mut swips = Vec::with_capacity(page_count);
 
@@ -649,7 +684,7 @@ fn initialize_dataset(
             manager,
             index,
             page_count,
-            compressibility_pct,
+            payload,
             RESOURCE_RETRY_TIMEOUT,
         )?);
     }
@@ -661,14 +696,14 @@ fn initialize_dataset_parallel(
     manager: &Arc<BufferManager>,
     page_count: usize,
     worker_count: usize,
-    compressibility_pct: u8,
+    payload: PayloadDescriptor,
 ) -> Result<Vec<Swip>, String> {
     parallel_collect_ordered(page_count, worker_count, |index| {
         initialize_page(
             manager,
             index,
             page_count,
-            compressibility_pct,
+            payload,
             S3_RESOURCE_RETRY_TIMEOUT,
         )
     })
@@ -678,14 +713,22 @@ fn initialize_page(
     manager: &Arc<BufferManager>,
     index: usize,
     page_count: usize,
-    compressibility_pct: u8,
+    payload: PayloadDescriptor,
     retry_timeout: Duration,
 ) -> Result<Swip, String> {
     let retry_deadline = Instant::now() + retry_timeout;
     loop {
         match manager.allocate() {
             Ok(mut guard) => {
-                guard.write_with(|page| fill_page(page, index, compressibility_pct));
+                guard.write_with(|page| {
+                    fill_page(
+                        page,
+                        index,
+                        payload.shape,
+                        payload.compressibility_pct,
+                        payload.spread_pct,
+                    )
+                });
                 return Ok(guard.swip());
             }
             Err(TierBufError::PoolExhausted) if Instant::now() < retry_deadline => {
@@ -1078,6 +1121,32 @@ fn page_marker(index: usize) -> u8 {
     u8::try_from(mixed % 251 + 1).expect("page marker is in the range 1..=251")
 }
 
+/// Internal structure of one generated benchmark page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PayloadShape {
+    /// One zero-filled prefix followed by a pseudorandom tail.
+    ///
+    /// Every page shares an identical layout, which keeps results comparable
+    /// with runs recorded before the other shapes existed.
+    #[default]
+    Uniform,
+    /// Alternating variable-length compressible and incompressible runs.
+    ///
+    /// Run boundaries, run lengths, and the repeated token inside each
+    /// compressible run all vary, so LZ4 sees match lengths and literal spans
+    /// closer to real records than a single large zero block does.
+    Chunked,
+}
+
+impl PayloadShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Chunked => "chunked",
+        }
+    }
+}
+
 /// Returns the leading zero-filled byte count for one payload compressibility.
 ///
 /// The first byte always carries the verification marker, so the result is at
@@ -1087,43 +1156,153 @@ fn compressible_prefix_len(compressibility_pct: u8) -> usize {
     1 + (PAGE_SIZE - 1) * percent / 100
 }
 
-/// Writes the verification marker and a payload with the requested compressibility.
+/// Returns a nonzero xorshift state derived from a page index and salt.
+fn payload_state(index: usize, salt: u64) -> u64 {
+    let state = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ salt;
+    // A zero xorshift state would stay zero and silently make one page fully
+    // compressible regardless of the requested percentage.
+    if state == 0 { PAYLOAD_SEED_SALT } else { state }
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Returns the compressibility applied to one page.
 ///
-/// Bytes inside the compressible prefix stay zero, which LZ4 collapses almost
-/// entirely, while the remaining tail holds deterministic pseudorandom bytes
-/// that LZ4 cannot shrink. Sweeping the percentage therefore sweeps the
-/// achievable compression ratio without disturbing the access pattern, page
-/// count, or verification cost.
-fn fill_page(page: &mut [u8; PAGE_SIZE], index: usize, compressibility_pct: u8) {
-    let prefix = compressible_prefix_len(compressibility_pct);
-    page[..prefix].fill(0);
-
-    let mut state = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ PAYLOAD_SEED_SALT;
-    if state == 0 {
-        // A zero xorshift state would stay zero and silently make one page
-        // fully compressible regardless of the requested percentage.
-        state = PAYLOAD_SEED_SALT;
+/// With a nonzero spread each page draws its own target from
+/// `[base - spread, base + spread]` clamped to `0..=100`, so one dataset holds
+/// a distribution of compression ratios instead of a single value.
+fn page_compressibility(index: usize, base_pct: u8, spread_pct: u8) -> u8 {
+    let base = base_pct.min(100);
+    if spread_pct == 0 {
+        return base;
     }
-    for chunk in page[prefix..].chunks_mut(size_of::<u64>()) {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
-    }
+    let low = base.saturating_sub(spread_pct);
+    let high = base.saturating_add(spread_pct).min(100);
+    let span = u64::from(high - low) + 1;
+    let mut state = payload_state(index, PAYLOAD_SPREAD_SALT);
+    let draw = u8::try_from(next_random(&mut state) % span).unwrap_or(0);
+    low.saturating_add(draw).min(100)
+}
 
+/// Writes the verification marker and a payload with the requested shape.
+///
+/// The marker is always written last so page verification stays independent of
+/// the payload shape, and both shapes touch the whole page so the measured
+/// access cost does not change with the selected structure.
+fn fill_page(
+    page: &mut [u8; PAGE_SIZE],
+    index: usize,
+    shape: PayloadShape,
+    base_pct: u8,
+    spread_pct: u8,
+) {
+    let compressibility_pct = page_compressibility(index, base_pct, spread_pct);
+    match shape {
+        PayloadShape::Uniform => fill_uniform(page, index, compressibility_pct),
+        PayloadShape::Chunked => fill_chunked(page, index, compressibility_pct),
+    }
     page[0] = page_marker(index);
 }
 
-/// Returns the LZ4 envelope ratio achieved by one representative payload.
+fn fill_uniform(page: &mut [u8; PAGE_SIZE], index: usize, compressibility_pct: u8) {
+    let prefix = compressible_prefix_len(compressibility_pct);
+    page[..prefix].fill(0);
+
+    let mut state = payload_state(index, PAYLOAD_SEED_SALT);
+    for chunk in page[prefix..].chunks_mut(size_of::<u64>()) {
+        let value = next_random(&mut state);
+        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+    }
+}
+
+/// Fills one page with alternating compressible and incompressible runs.
 ///
-/// Every page shares the same compressible-prefix structure, so encoding a
-/// single sample reports the ratio the file tier will achieve without adding
-/// per-page accounting to the library.
-fn sampled_compression_ratio(compressibility_pct: u8) -> Option<f64> {
+/// A deficit scheduler picks each run's kind by comparing the compressible
+/// bytes written so far against the target share of the bytes emitted so far,
+/// so the achieved ratio converges on `compressibility_pct` while run lengths
+/// stay irregular.
+fn fill_chunked(page: &mut [u8; PAGE_SIZE], index: usize, compressibility_pct: u8) {
+    let mut state = payload_state(index, PAYLOAD_CHUNK_SALT);
+    let target = u64::from(compressibility_pct.min(100));
+    let mut offset = 0;
+    let mut compressible_written = 0_u64;
+
+    while offset < PAGE_SIZE {
+        let span = PAYLOAD_MAX_RUN - PAYLOAD_MIN_RUN + 1;
+        let length =
+            (PAYLOAD_MIN_RUN + (next_random(&mut state) as usize) % span).min(PAGE_SIZE - offset);
+        let emitted = offset as u64;
+        let compressible = compressible_written * 100 < target * emitted.max(1);
+
+        if compressible {
+            // Repeat a short run-specific token. LZ4 collapses this into one
+            // long match, but unlike a zero block each run carries different
+            // literal bytes, which is closer to repeated record fields.
+            let token_len = 1 + (next_random(&mut state) as usize) % PAYLOAD_MAX_TOKEN;
+            let mut token = [0_u8; PAYLOAD_MAX_TOKEN];
+            for byte in token.iter_mut().take(token_len) {
+                *byte = (next_random(&mut state) & 0xff) as u8;
+            }
+            for (position, byte) in page[offset..offset + length].iter_mut().enumerate() {
+                *byte = token[position % token_len];
+            }
+            compressible_written += length as u64;
+        } else {
+            for chunk in page[offset..offset + length].chunks_mut(size_of::<u64>()) {
+                let value = next_random(&mut state);
+                chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+            }
+        }
+        offset += length;
+    }
+}
+
+/// LZ4 envelope ratios measured over a sample of generated pages.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CompressionSample {
+    pages: usize,
+    mean: f64,
+    min: f64,
+    max: f64,
+}
+
+/// Returns the LZ4 envelope ratios achieved by a sample of generated pages.
+///
+/// A single page is no longer representative once the shape varies run lengths
+/// or the spread varies compressibility across pages, so the sample reports the
+/// spread of ratios the tier will actually store.
+fn sampled_compression(
+    shape: PayloadShape,
+    base_pct: u8,
+    spread_pct: u8,
+    pages: usize,
+) -> Option<CompressionSample> {
+    let pages = pages.max(1);
     let mut page = Box::new([0_u8; PAGE_SIZE]);
-    fill_page(&mut page, 0, compressibility_pct);
-    let envelope = encode_page(page.as_slice(), PageCodec::Lz4).ok()?;
-    Some(envelope.len() as f64 / PAGE_SIZE as f64)
+    let mut total = 0.0;
+    let mut min = f64::INFINITY;
+    let mut max = 0.0_f64;
+
+    for index in 0..pages {
+        fill_page(&mut page, index, shape, base_pct, spread_pct);
+        let envelope = encode_page(page.as_slice(), PageCodec::Lz4).ok()?;
+        let ratio = envelope.len() as f64 / PAGE_SIZE as f64;
+        total += ratio;
+        min = min.min(ratio);
+        max = max.max(ratio);
+    }
+
+    Some(CompressionSample {
+        pages,
+        mean: total / pages as f64,
+        min,
+        max,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1642,7 +1821,9 @@ struct Config {
     scan_only: bool,
     file_tier: Option<PathBuf>,
     file_compression: bool,
+    payload_shape: PayloadShape,
     payload_compressibility_pct: u8,
+    payload_spread_pct: u8,
     s3: Option<S3BenchConfig>,
     output: PathBuf,
     stats_output: PathBuf,
@@ -1664,7 +1845,9 @@ impl Default for Config {
             scan_only: false,
             file_tier: None,
             file_compression: false,
+            payload_shape: PayloadShape::Uniform,
             payload_compressibility_pct: DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
+            payload_spread_pct: 0,
             s3: None,
             output: PathBuf::from(DEFAULT_OUTPUT),
             stats_output: PathBuf::from(DEFAULT_STATS_OUTPUT),
@@ -1804,7 +1987,9 @@ where
     let mut scan_only = false;
     let mut file_tier = None;
     let mut file_compression = None;
+    let mut payload_shape = None;
     let mut payload_compressibility = None;
+    let mut payload_spread = None;
     let mut s3_bucket = None;
     let mut s3_region = None;
     let mut s3_endpoint = None;
@@ -1876,8 +2061,14 @@ where
             "--file-compression" => {
                 file_compression = Some(parse_toggle(&next_value()?, flag)?);
             }
+            "--payload-shape" => {
+                payload_shape = Some(parse_payload_shape(&next_value()?, flag)?);
+            }
             "--payload-compressibility" => {
                 payload_compressibility = Some(parse_percentage(&next_value()?, flag)?);
+            }
+            "--payload-spread" => {
+                payload_spread = Some(parse_percentage(&next_value()?, flag)?);
             }
             "--s3-bucket" => {
                 s3_bucket = Some(next_value()?);
@@ -1974,8 +2165,14 @@ where
         config.file_tier = Some(value);
     }
     config.file_compression = file_compression.unwrap_or(false);
+    if let Some(value) = payload_shape {
+        config.payload_shape = value;
+    }
     if let Some(value) = payload_compressibility {
         config.payload_compressibility_pct = value;
+    }
+    if let Some(value) = payload_spread {
+        config.payload_spread_pct = value;
     }
     if let Some(bucket) = s3_bucket {
         let capacity_mib = match s3_capacity_mib {
@@ -2035,6 +2232,16 @@ fn parse_toggle(value: &str, flag: &str) -> Result<bool, String> {
         "on" => Ok(true),
         "off" => Ok(false),
         _ => Err(format!("{flag} expects 'on' or 'off'; got '{value}'")),
+    }
+}
+
+fn parse_payload_shape(value: &str, flag: &str) -> Result<PayloadShape, String> {
+    match value {
+        "uniform" => Ok(PayloadShape::Uniform),
+        "chunked" => Ok(PayloadShape::Chunked),
+        _ => Err(format!(
+            "{flag} expects 'uniform' or 'chunked'; got '{value}'"
+        )),
     }
 }
 
@@ -2123,9 +2330,13 @@ Options:
     --file-tier PATH        Use a reusable FileTier; precedes S3 when both are set
     --file-compression MODE FileTier LZ4 slot compression: on or off (default);
                             'on' also disables the io_uring read path
+    --payload-shape SHAPE   Page structure: uniform (default) one zero prefix
+                            plus a random tail, or chunked variable-length runs
     --payload-compressibility PCT
-                            Percent of each page that is zero-filled and thus
-                            compressible; 0 is incompressible (default: 100)
+                            Target percent of each page that is compressible;
+                            0 is incompressible (default: 100)
+    --payload-spread PCT    Per-page compressibility variation around the target,
+                            so one dataset holds a distribution (default: 0)
     --s3-bucket NAME        Enable an S3 tier for this bucket
     --s3-region REGION      S3 signing region (default: us-east-1)
     --s3-endpoint URL       Custom path-style endpoint for MinIO or LocalStack
@@ -2163,11 +2374,11 @@ mod tests {
 
     use super::{
         BenchRow, CSV_HEADER, CliAction, Config, CsvOutput, DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
-        DramFraction, EvictionMode, POINT_ACCESS_PERCENT, PayloadDescriptor, PhaseResult, TierKind,
-        WorkloadState, ZipfSampler, compressible_prefix_len, fill_page, format_csv_row,
-        fraction_stats_json, initialize_dataset_parallel, page_marker, parallel_collect_ordered,
-        parse_cli, percentile, s3_client_config, s3_stats_json, sampled_compression_ratio,
-        smoke_object_api, tier_plan,
+        DramFraction, EvictionMode, POINT_ACCESS_PERCENT, PayloadDescriptor, PayloadShape,
+        PhaseResult, TierKind, WorkloadState, ZipfSampler, compressible_prefix_len, fill_page,
+        format_csv_row, fraction_stats_json, initialize_dataset_parallel, page_compressibility,
+        page_marker, parallel_collect_ordered, parse_cli, percentile, s3_client_config,
+        s3_stats_json, sampled_compression, smoke_object_api, tier_plan,
     };
 
     #[derive(Clone, Default)]
@@ -2400,12 +2611,26 @@ mod tests {
         assert!(config.file_compression);
         assert_eq!(config.payload_compressibility_pct, 40);
 
+        let shaped = run_config(&[
+            "--payload-shape",
+            "chunked",
+            "--payload-compressibility",
+            "60",
+            "--payload-spread",
+            "25",
+        ]);
+        assert_eq!(shaped.payload_shape, PayloadShape::Chunked);
+        assert_eq!(shaped.payload_compressibility_pct, 60);
+        assert_eq!(shaped.payload_spread_pct, 25);
+
         let defaults = run_config(&["--file-tier", "/tmp/tierbuf-file"]);
         assert!(!defaults.file_compression);
         assert_eq!(
             defaults.payload_compressibility_pct,
             DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT
         );
+        assert_eq!(defaults.payload_shape, PayloadShape::Uniform);
+        assert_eq!(defaults.payload_spread_pct, 0);
 
         // The payload shape is tier-independent, so it is valid on its own.
         assert_eq!(
@@ -2421,6 +2646,8 @@ mod tests {
                 "--file-compression",
                 "yes",
             ],
+            vec!["--payload-shape", "random"],
+            vec!["--payload-spread", "101"],
             vec!["--payload-compressibility", "101"],
             vec!["--payload-compressibility", "-1"],
             vec!["--payload-compressibility", "half"],
@@ -2436,14 +2663,14 @@ mod tests {
     fn payload_compressibility_spans_incompressible_to_all_zero() {
         let mut page = Box::new([0_u8; PAGE_SIZE]);
 
-        fill_page(&mut page, 7, 100);
+        fill_page(&mut page, 7, PayloadShape::Uniform, 100, 0);
         assert_eq!(page[0], page_marker(7));
         assert!(
             page[1..].iter().all(|byte| *byte == 0),
             "a fully compressible page keeps the historical all-zero payload"
         );
 
-        fill_page(&mut page, 7, 0);
+        fill_page(&mut page, 7, PayloadShape::Uniform, 0, 0);
         assert_eq!(page[0], page_marker(7));
         let nonzero = page[1..].iter().filter(|byte| **byte != 0).count();
         assert!(
@@ -2452,33 +2679,106 @@ mod tests {
         );
 
         // The prefix boundary is exact, so a mid sweep splits the page.
-        fill_page(&mut page, 7, 50);
+        fill_page(&mut page, 7, PayloadShape::Uniform, 50, 0);
         let prefix = compressible_prefix_len(50);
         assert!(page[1..prefix].iter().all(|byte| *byte == 0));
         assert!(page[prefix..].iter().any(|byte| *byte != 0));
     }
 
+    fn sample(shape: PayloadShape, base: u8, spread: u8) -> super::CompressionSample {
+        sampled_compression(shape, base, spread, 32).expect("LZ4 sampling requires the lz4 feature")
+    }
+
     #[test]
     fn sampled_compression_ratio_decreases_with_compressibility() {
-        let incompressible =
-            sampled_compression_ratio(0).expect("LZ4 sampling requires the lz4 feature");
-        let mixed = sampled_compression_ratio(50).expect("LZ4 sampling requires the lz4 feature");
-        let compressible =
-            sampled_compression_ratio(100).expect("LZ4 sampling requires the lz4 feature");
+        for shape in [PayloadShape::Uniform, PayloadShape::Chunked] {
+            let incompressible = sample(shape, 0, 0).mean;
+            let mixed = sample(shape, 50, 0).mean;
+            let compressible = sample(shape, 100, 0).mean;
+
+            assert!(
+                compressible < mixed && mixed < incompressible,
+                "{}: ratios should fall as compressibility rises: \
+                 {compressible} < {mixed} < {incompressible}",
+                shape.label()
+            );
+            assert!(
+                incompressible >= 1.0,
+                "{}: random payloads must fall back to verbatim storage, got {incompressible}",
+                shape.label()
+            );
+        }
 
         assert!(
-            compressible < mixed && mixed < incompressible,
-            "ratios should fall as compressibility rises: \
-             {compressible} < {mixed} < {incompressible}"
+            sample(PayloadShape::Uniform, 100, 0).mean < 0.05,
+            "all-zero payloads should compress hard"
+        );
+    }
+
+    #[test]
+    fn chunked_pages_vary_while_uniform_pages_do_not() {
+        let uniform = sample(PayloadShape::Uniform, 50, 0);
+        let chunked = sample(PayloadShape::Chunked, 50, 0);
+
+        // Every uniform page has an identical layout, so all ratios match.
+        assert_eq!(
+            uniform.min, uniform.max,
+            "uniform pages should all compress identically"
         );
         assert!(
-            incompressible >= 1.0,
-            "random payloads must fall back to verbatim storage, got {incompressible}"
+            chunked.max > chunked.min,
+            "chunked run lengths should produce a range of ratios, got {}..{}",
+            chunked.min,
+            chunked.max
         );
+        assert_eq!(chunked.pages, 32);
+    }
+
+    #[test]
+    fn spread_widens_the_ratio_distribution() {
+        let tight = sample(PayloadShape::Uniform, 50, 0);
+        let wide = sample(PayloadShape::Uniform, 50, 40);
+
         assert!(
-            compressible < 0.05,
-            "all-zero payloads should compress hard, got {compressible}"
+            wide.max - wide.min > tight.max - tight.min,
+            "spread should widen the ratio range: {}..{} vs {}..{}",
+            wide.min,
+            wide.max,
+            tight.min,
+            tight.max
         );
+    }
+
+    #[test]
+    fn page_compressibility_is_deterministic_and_bounded() {
+        // Zero spread pins every page to the requested target.
+        for index in [0, 1, 999] {
+            assert_eq!(page_compressibility(index, 60, 0), 60);
+        }
+
+        let mut seen_low = false;
+        let mut seen_high = false;
+        for index in 0..512 {
+            let drawn = page_compressibility(index, 50, 30);
+            assert!(
+                (20..=80).contains(&drawn),
+                "page {index} drew {drawn} outside the spread window"
+            );
+            assert_eq!(
+                drawn,
+                page_compressibility(index, 50, 30),
+                "page {index} must draw deterministically"
+            );
+            seen_low |= drawn < 50;
+            seen_high |= drawn > 50;
+        }
+        assert!(seen_low && seen_high, "spread should draw both directions");
+
+        // Clamping keeps the window inside 0..=100 at the extremes.
+        for index in 0..64 {
+            assert!(page_compressibility(index, 95, 30) <= 100);
+            assert!(page_compressibility(index, 5, 30) <= 35);
+        }
     }
 
     #[test]
@@ -2585,9 +2885,8 @@ mod tests {
         })
         .expect("buffer manager");
 
-        let swips =
-            initialize_dataset_parallel(&manager, 64, 8, DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT)
-                .expect("parallel initialization");
+        let swips = initialize_dataset_parallel(&manager, 64, 8, PayloadDescriptor::default())
+            .expect("parallel initialization");
         assert_eq!(swips.len(), 64);
         for (index, swip) in swips.iter().enumerate() {
             let guard = manager.fix_shared(swip).expect("initialized page");
@@ -2613,9 +2912,8 @@ mod tests {
         })
         .expect("buffer manager");
 
-        let swips =
-            initialize_dataset_parallel(&manager, 64, 8, DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT)
-                .expect("parallel initialization");
+        let swips = initialize_dataset_parallel(&manager, 64, 8, PayloadDescriptor::default())
+            .expect("parallel initialization");
         assert_eq!(swips.len(), 64);
         let peak = probe.peak.load(Ordering::Acquire);
         assert!(peak > 1, "expected concurrent tier writes, observed {peak}");
@@ -2669,7 +2967,9 @@ mod tests {
                 ..S3TierStats::default()
             }),
             PayloadDescriptor {
+                shape: PayloadShape::Uniform,
                 compressibility_pct: 100,
+                spread_pct: 0,
                 file_compression: false,
             },
         )
