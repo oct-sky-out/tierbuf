@@ -130,6 +130,7 @@ jobs:
           scripts/test_visualize_bench.py
           scripts/test_bench_duration_sweep.py
           scripts/test_s3_cliff_demo.py
+          scripts/test_file_compression_demo.py
 
   degradation-quick:
     name: Quick degradation curve

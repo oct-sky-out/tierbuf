@@ -6,6 +6,18 @@ All notable changes to tierbuf are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `tierbuf-bench --file-compression on|off` selects the FileTier LZ4 codec, and
+  `--payload-compressibility PCT` shapes how compressible generated pages are.
+  The default of 100 reproduces the previous all-zero payload exactly, so
+  earlier results stay comparable.
+- `scripts/file_compression_demo.py` sweeps both compression modes across
+  payload compressibility and reports the break-even point, with EC2 support
+  through `BENCH_FILE_COMPRESSION_DEMO` in the AWS harness.
+- Benchmark stats JSON records a per-run `payload` descriptor holding the
+  requested compressibility, the file-tier codec, and the sampled LZ4 ratio.
+
 ### Changed
 
 - Raised the workspace Rust requirement from 1.88 to 1.97.1 and pinned local
