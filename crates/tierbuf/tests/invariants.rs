@@ -162,6 +162,7 @@ fn test_manager() -> Arc<BufferManager> {
             epoch: Duration::from_micros(50),
         },
         tiers: vec![Box::new(tier) as Box<dyn TierBackend>],
+        ..BufConfig::default()
     })
     .expect("model-test BufferManager configuration is valid")
 }

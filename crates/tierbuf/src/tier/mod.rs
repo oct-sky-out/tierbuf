@@ -12,8 +12,11 @@ use std::time::Duration;
 use crate::atomic::try_update_u64;
 use crate::{Result, TierBufError};
 
+pub mod envelope;
 pub mod file;
 pub mod mock;
+#[cfg(feature = "s3")]
+pub mod s3;
 
 const NANOS_PER_DAY: u128 = 86_400 * 1_000_000_000;
 
@@ -79,6 +82,15 @@ impl LatencyProfile {
             seq_gbps,
         }
     }
+}
+
+/// Per-request monetary costs charged by a storage tier.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RequestCosts {
+    /// Dollars charged per read request.
+    pub read_usd: f64,
+    /// Dollars charged per write request.
+    pub write_usd: f64,
 }
 
 /// A deterministic token bucket limiting bytes written to a storage tier.
@@ -269,6 +281,13 @@ pub trait TierBackend: Send + Sync + 'static {
 
     /// Returns this tier's storage price in dollars per GiB-month.
     fn price_gb_month(&self) -> f64;
+
+    /// Returns per-request costs charged by this tier.
+    ///
+    /// Local tiers normally keep the zero-cost default.
+    fn request_costs(&self) -> RequestCosts {
+        RequestCosts::default()
+    }
 
     /// Returns this tier's write-endurance budget, if one is enforced.
     fn write_budget(&self) -> Option<&WriteBudget>;

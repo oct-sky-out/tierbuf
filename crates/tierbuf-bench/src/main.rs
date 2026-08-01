@@ -5,19 +5,26 @@ use std::env;
 use std::fs::{self, File};
 use std::hint::black_box;
 use std::io::{BufWriter, Write};
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 use tierbuf::metrics::{TierCounters, TierStats};
 use tierbuf::policy::AccessHint;
 use tierbuf::pool::{BufConfig, BufferManager, Economics, EvictionMode, FixSource};
 use tierbuf::swip::Swip;
+use tierbuf::tier::envelope::{PageCodec, encode_page};
 use tierbuf::tier::file::{FileTier, FileTierConfig};
 use tierbuf::tier::mock::MockTier;
+use tierbuf::tier::s3::client::{ObjectApi, S3Client, S3ClientConfig};
+use tierbuf::tier::s3::credentials::CredentialSource;
+use tierbuf::tier::s3::{S3Tier, S3TierConfig, S3TierStats, S3TierStatsHandle};
 use tierbuf::tier::{LatencyProfile, TierBackend};
 use tierbuf::{PAGE_SIZE, TierBufError};
 
@@ -27,6 +34,26 @@ const DEFAULT_WARMUP: Duration = Duration::from_secs(10);
 const DEFAULT_MEASUREMENT: Duration = Duration::from_secs(30);
 const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_MOCK_LATENCY_US: u64 = 80;
+const DEFAULT_PREFETCH_WORKERS: usize = 4;
+const DEFAULT_PREFETCH_IN_FLIGHT: usize = 128;
+const DEFAULT_S3_PREFETCH_WORKERS: usize = 64;
+const DEFAULT_S3_PREFETCH_IN_FLIGHT: usize = 256;
+const DEFAULT_S3_REGION: &str = "us-east-1";
+/// Percentage of each page filled with zeros before the pseudorandom tail.
+///
+/// The default keeps the historical all-zero payload, so runs recorded before
+/// this option existed remain directly comparable.
+const DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT: u8 = 100;
+const PAYLOAD_SEED_SALT: u64 = 0x510e_527f_ade6_82d1;
+const PAYLOAD_SPREAD_SALT: u64 = 0x9b05_688c_2b3e_6c1f;
+const PAYLOAD_CHUNK_SALT: u64 = 0x1f83_d9ab_fb41_bd6b;
+/// Shortest and longest run emitted by the chunked payload shape.
+const PAYLOAD_MIN_RUN: usize = 64;
+const PAYLOAD_MAX_RUN: usize = 8 * 1024;
+/// Longest repeated token used inside one compressible run.
+const PAYLOAD_MAX_TOKEN: usize = 16;
+/// Pages encoded when reporting the achieved compression ratio.
+const PAYLOAD_SAMPLE_PAGES: usize = 64;
 const DEFAULT_OUTPUT: &str = "results/curve.csv";
 const DEFAULT_STATS_OUTPUT: &str = "results/stats.json";
 const ECONOMIC_EPOCH: Duration = Duration::from_millis(100);
@@ -39,6 +66,7 @@ const SCAN_PREFETCH_WINDOW: usize = 8;
 const SAMPLE_EVERY_OPERATIONS: u64 = 64;
 const MAX_LATENCY_SAMPLES_PER_WORKER: usize = 50_000;
 const RESOURCE_RETRY_TIMEOUT: Duration = Duration::from_secs(2);
+const S3_RESOURCE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
 const RESOURCE_RETRY_PAUSE: Duration = Duration::from_micros(100);
 const CSV_HEADER: &str = concat!(
     "fraction,throughput_ops,p50_us,p99_us,cost_usd_per_1e6ops,",
@@ -81,6 +109,7 @@ fn run_from_env() -> Result<(), String> {
 
 fn run_benchmark(config: &Config) -> Result<(), String> {
     let layout = config.dataset_layout()?;
+    let s3_runtime = prepare_s3_runtime(config)?;
     let mut output = CsvOutput::open(&config.output)?;
     let mut stats_runs = Vec::with_capacity(config.fractions.len());
 
@@ -99,7 +128,7 @@ fn run_benchmark(config: &Config) -> Result<(), String> {
             layout.page_count,
             fraction.dram_pages(layout.page_count)?
         );
-        let (row, stats) = run_fraction(config, layout, fraction)?;
+        let (row, stats) = run_fraction(config, layout, fraction, s3_runtime.as_ref())?;
         output.append(&row)?;
         stats_runs.push(stats);
         println!("{}", format_csv_row(&row).trim_end());
@@ -113,11 +142,28 @@ fn run_fraction(
     config: &Config,
     layout: DatasetLayout,
     fraction: DramFraction,
+    s3_runtime: Option<&S3Runtime>,
 ) -> Result<(BenchRow, Value), String> {
-    let manager = make_manager(config, layout, fraction)?;
+    let ManagerContext { manager, s3_stats } = make_manager(config, layout, fraction, s3_runtime)?;
 
     let benchmark_result = (|| {
-        let swips: Arc<[Swip]> = initialize_dataset(&manager, layout.page_count)?.into();
+        let initialized = if config.s3.is_some() {
+            // Keep loading concurrency fixed so --compare-prefetch changes
+            // only the measured prefetch path, not the initial resident set.
+            initialize_dataset_parallel(
+                &manager,
+                layout.page_count,
+                DEFAULT_S3_PREFETCH_WORKERS,
+                PayloadDescriptor::from_config(config),
+            )?
+        } else {
+            initialize_dataset(
+                &manager,
+                layout.page_count,
+                PayloadDescriptor::from_config(config),
+            )?
+        };
+        let swips: Arc<[Swip]> = initialized.into();
         let zipf = Arc::new(ZipfSampler::new(layout.page_count)?);
 
         run_phase(
@@ -160,7 +206,14 @@ fn run_fraction(
             stats_after.prefetch_skipped
         );
 
-        let stats_dump = fraction_stats_json(fraction, &measured, &stats_before, &stats_after)?;
+        let stats_dump = fraction_stats_json(
+            fraction,
+            &measured,
+            &stats_before,
+            &stats_after,
+            s3_stats.as_ref().map(S3TierStatsHandle::snapshot),
+            PayloadDescriptor::from_config(config),
+        )?;
         let row = BenchRow::from_measurement(
             fraction,
             measured,
@@ -171,9 +224,19 @@ fn run_fraction(
         Ok((row, stats_dump))
     })();
 
-    let shutdown_result = manager
-        .shutdown()
-        .map_err(|error| format!("failed to shut down fraction {}: {error}", fraction.label()));
+    let shutdown_result = if config.s3.is_some() {
+        // S3 benchmark prefixes are ephemeral. BufferManager::shutdown would
+        // synchronously persist every still-resident dirty page, adding a
+        // serial tail that is outside the measured workload. Dropping the
+        // manager invokes its non-flushing Drop path, which signals workers
+        // and unswizzles resident pages without creating extra S3 objects.
+        drop(manager);
+        Ok(())
+    } else {
+        manager
+            .shutdown()
+            .map_err(|error| format!("failed to shut down fraction {}: {error}", fraction.label()))
+    };
 
     match (benchmark_result, shutdown_result) {
         (Ok(result), Ok(())) => Ok(result),
@@ -224,10 +287,13 @@ fn fraction_stats_json(
     measured: &PhaseResult,
     stats_before: &TierStats,
     stats_after: &TierStats,
+    s3_stats: Option<S3TierStats>,
+    payload: PayloadDescriptor,
 ) -> Result<Value, String> {
     let measurement_stats = tier_stats_delta(stats_before, stats_after)?;
-    Ok(json!({
+    let mut run = json!({
         "fraction": fraction.label(),
+        "payload": payload_json(payload),
         "measurement_seconds": measured.elapsed.as_secs_f64(),
         "measurement_operations": {
             "total": measured.operations,
@@ -238,7 +304,79 @@ fn fraction_stats_json(
         },
         "measurement_stats": tier_stats_json(&measurement_stats),
         "cumulative_stats": tier_stats_json(stats_after),
-    }))
+    });
+    if let Some(s3_stats) = s3_stats
+        && let Some(run) = run.as_object_mut()
+    {
+        run.insert("s3".to_owned(), s3_stats_json(s3_stats));
+    }
+    Ok(run)
+}
+
+/// Payload and file-tier codec settings recorded alongside one measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PayloadDescriptor {
+    shape: PayloadShape,
+    compressibility_pct: u8,
+    spread_pct: u8,
+    file_compression: bool,
+}
+
+impl Default for PayloadDescriptor {
+    fn default() -> Self {
+        Self {
+            shape: PayloadShape::Uniform,
+            compressibility_pct: DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
+            spread_pct: 0,
+            file_compression: false,
+        }
+    }
+}
+
+impl PayloadDescriptor {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            shape: config.payload_shape,
+            compressibility_pct: config.payload_compressibility_pct,
+            spread_pct: config.payload_spread_pct,
+            file_compression: config.file_compression,
+        }
+    }
+}
+
+fn payload_json(payload: PayloadDescriptor) -> Value {
+    let sample = sampled_compression(
+        payload.shape,
+        payload.compressibility_pct,
+        payload.spread_pct,
+        PAYLOAD_SAMPLE_PAGES,
+    );
+    json!({
+        "shape": payload.shape.label(),
+        "compressibility_pct": payload.compressibility_pct,
+        "spread_pct": payload.spread_pct,
+        "file_compression": payload.file_compression,
+        "sampled_pages": sample.map(|sample| sample.pages),
+        "sampled_compression_ratio": sample.map(|sample| sample.mean),
+        "sampled_compression_ratio_min": sample.map(|sample| sample.min),
+        "sampled_compression_ratio_max": sample.map(|sample| sample.max),
+    })
+}
+
+fn s3_stats_json(stats: S3TierStats) -> Value {
+    let compression_ratio =
+        (stats.logical_bytes != 0).then(|| stats.stored_bytes as f64 / stats.logical_bytes as f64);
+    json!({
+        "get_requests": stats.get_requests,
+        "put_requests": stats.put_requests,
+        "delete_requests": stats.delete_requests,
+        "request_failures": stats.request_failures,
+        "stored_bytes": stats.stored_bytes,
+        "logical_bytes": stats.logical_bytes,
+        "bytes_uploaded": stats.bytes_uploaded,
+        "bytes_downloaded": stats.bytes_downloaded,
+        "compression_ratio": compression_ratio,
+    })
 }
 
 fn tier_stats_json(stats: &TierStats) -> Value {
@@ -341,93 +479,366 @@ fn tier_stats_delta(before: &TierStats, after: &TierStats) -> Result<TierStats, 
     })
 }
 
+struct S3Runtime {
+    client: Arc<S3Client>,
+}
+
+struct ManagerContext {
+    manager: Arc<BufferManager>,
+    s3_stats: Option<S3TierStatsHandle>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TierKind {
+    Mock,
+    File,
+    S3,
+}
+
+fn tier_plan(config: &Config) -> Vec<TierKind> {
+    let mut tiers = Vec::with_capacity(2);
+    if config.file_tier.is_some() {
+        tiers.push(TierKind::File);
+    }
+    if config.s3.is_some() {
+        tiers.push(TierKind::S3);
+    }
+    if tiers.is_empty() {
+        tiers.push(TierKind::Mock);
+    }
+    tiers
+}
+
+fn prepare_s3_runtime(config: &Config) -> Result<Option<S3Runtime>, String> {
+    let Some(s3) = config.s3.as_ref() else {
+        return Ok(None);
+    };
+    let client = Arc::new(
+        S3Client::new(s3_client_config(s3))
+            .map_err(|error| format!("failed to create S3 client: {error}"))?,
+    );
+    smoke_object_api(&*client, &s3.key_prefix)?;
+    Ok(Some(S3Runtime { client }))
+}
+
+fn s3_client_config(config: &S3BenchConfig) -> S3ClientConfig {
+    S3ClientConfig {
+        bucket: config.bucket.clone(),
+        region: config.region.clone(),
+        endpoint: config.endpoint.clone(),
+        credentials: CredentialSource::Auto,
+        ..S3ClientConfig::default()
+    }
+}
+
+fn smoke_object_api(api: &dyn ObjectApi, key_prefix: &str) -> Result<(), String> {
+    let unix_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let key = format!(
+        "{}__smoke-{}-{unix_nanos}",
+        with_trailing_slash(key_prefix),
+        std::process::id()
+    );
+    let page = vec![0xa5; PAGE_SIZE];
+    api.put(&key, &page)
+        .map_err(|error| format!("S3 startup smoke PUT failed: {error}"))?;
+    let fetched = api.get(&key);
+    let delete_result = api.delete(&key);
+    let fetched = fetched.map_err(|error| format!("S3 startup smoke GET failed: {error}"))?;
+    delete_result.map_err(|error| format!("S3 startup smoke DELETE failed: {error}"))?;
+    if fetched != page {
+        return Err("S3 startup smoke GET returned different page bytes".to_owned());
+    }
+    Ok(())
+}
+
+fn with_trailing_slash(prefix: &str) -> String {
+    if prefix.ends_with('/') {
+        prefix.to_owned()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
 fn make_manager(
     config: &Config,
     layout: DatasetLayout,
     fraction: DramFraction,
-) -> Result<Arc<BufferManager>, String> {
+    s3_runtime: Option<&S3Runtime>,
+) -> Result<ManagerContext, String> {
     let latency = LatencyProfile::new(
         config.mock_latency_us,
         config.mock_latency_us,
         MOCK_SEQUENTIAL_GIB_PER_SECOND,
     );
-    let tier: Box<dyn TierBackend> = if let Some(path) = &config.file_tier {
-        let mut file_config = FileTierConfig::new(layout.tier_capacity_bytes);
-        file_config.name = "file".to_owned();
-        file_config.price_gb_month = MOCK_PRICE_GIB_MONTH;
-        file_config.latency = latency;
-        Box::new(
-            FileTier::open(path, file_config)
-                .map_err(|error| format!("failed to create FileTier: {error}"))?,
-        )
-    } else {
-        Box::new(
-            MockTier::with_options(
-                "mock",
-                layout.tier_capacity_bytes,
-                MOCK_PRICE_GIB_MONTH,
-                latency,
-                None,
-            )
-            .map_err(|error| format!("failed to create MockTier: {error}"))?,
-        )
-    };
+    let mut tiers: Vec<Box<dyn TierBackend>> = Vec::with_capacity(2);
+    let mut s3_stats = None;
+    for kind in tier_plan(config) {
+        match kind {
+            TierKind::Mock => {
+                tiers.push(Box::new(
+                    MockTier::with_options(
+                        "mock",
+                        layout.tier_capacity_bytes,
+                        MOCK_PRICE_GIB_MONTH,
+                        latency,
+                        None,
+                    )
+                    .map_err(|error| format!("failed to create MockTier: {error}"))?,
+                ));
+            }
+            TierKind::File => {
+                let path = config
+                    .file_tier
+                    .as_ref()
+                    .ok_or_else(|| "file tier plan is missing its path".to_owned())?;
+                let mut file_config = FileTierConfig::new(layout.tier_capacity_bytes);
+                file_config.name = "file".to_owned();
+                file_config.price_gb_month = MOCK_PRICE_GIB_MONTH;
+                file_config.latency = latency;
+                // Compression makes FileTier withhold its raw descriptor, so
+                // this also selects the synchronous read path over io_uring.
+                file_config.codec = if config.file_compression {
+                    PageCodec::Lz4
+                } else {
+                    PageCodec::None
+                };
+                tiers
+                    .push(Box::new(FileTier::open(path, file_config).map_err(
+                        |error| format!("failed to create FileTier: {error}"),
+                    )?));
+            }
+            TierKind::S3 => {
+                let options = config
+                    .s3
+                    .as_ref()
+                    .ok_or_else(|| "S3 tier plan is missing its configuration".to_owned())?;
+                let runtime = s3_runtime
+                    .ok_or_else(|| "S3 tier plan is missing its prepared client".to_owned())?;
+                let capacity_bytes = options
+                    .capacity_mib
+                    .checked_mul(MIB)
+                    .ok_or_else(|| "--s3-capacity-mib is too large".to_owned())?;
+                let fraction_prefix = format!(
+                    "{}fraction-{}/",
+                    with_trailing_slash(&options.key_prefix),
+                    fraction.label()
+                );
+                let object_api: Arc<dyn ObjectApi> = runtime.client.clone();
+                let tier = S3Tier::with_object_api(
+                    object_api,
+                    S3TierConfig {
+                        capacity_bytes,
+                        codec: if options.compression {
+                            PageCodec::Lz4
+                        } else {
+                            PageCodec::None
+                        },
+                        key_prefix: fraction_prefix,
+                        ..S3TierConfig::default()
+                    },
+                )
+                .map_err(|error| format!("failed to create S3Tier: {error}"))?;
+                s3_stats = Some(tier.stats_handle());
+                tiers.push(Box::new(tier));
+            }
+        }
+    }
     let dram_pages = fraction.dram_pages(layout.page_count)?;
     let dram_pool_bytes = dram_pages
         .checked_mul(PAGE_SIZE)
         .ok_or_else(|| "DRAM pool size overflowed usize".to_owned())?;
 
-    BufferManager::new(BufConfig {
+    let manager = BufferManager::new(BufConfig {
         dram_pool_bytes,
-        cooling_ratio: 0.1,
         eviction_mode: config.eviction_mode,
         economics: Economics {
             dram_price_gb_month: DRAM_PRICE_GIB_MONTH,
             epoch: ECONOMIC_EPOCH,
         },
-        tiers: vec![tier],
+        tiers,
+        prefetch_workers: config.prefetch_workers,
+        max_prefetch_in_flight: config.prefetch_in_flight,
+        ..BufConfig::default()
     })
     .map_err(|error| {
         format!(
             "failed to create buffer manager for fraction {}: {error}",
             fraction.label()
         )
-    })
+    })?;
+    Ok(ManagerContext { manager, s3_stats })
 }
 
 fn initialize_dataset(
     manager: &Arc<BufferManager>,
     page_count: usize,
+    payload: PayloadDescriptor,
 ) -> Result<Vec<Swip>, String> {
     let mut swips = Vec::with_capacity(page_count);
 
     for index in 0..page_count {
-        let retry_deadline = Instant::now() + RESOURCE_RETRY_TIMEOUT;
-        loop {
-            match manager.allocate() {
-                Ok(mut guard) => {
-                    guard.write_with(|page| page[0] = page_marker(index));
-                    swips.push(guard.swip());
-                    break;
-                }
-                Err(TierBufError::PoolExhausted) if Instant::now() < retry_deadline => {
-                    thread::sleep(RESOURCE_RETRY_PAUSE);
-                }
-                Err(TierBufError::PoolExhausted) => {
-                    return Err(pool_exhausted_message(&format!(
-                        "initializing logical page {index} of {page_count}"
-                    )));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "failed to initialize logical page {index} of {page_count}: {error}"
-                    ));
-                }
-            }
-        }
+        swips.push(initialize_page(
+            manager,
+            index,
+            page_count,
+            payload,
+            RESOURCE_RETRY_TIMEOUT,
+        )?);
     }
 
     Ok(swips)
+}
+
+fn initialize_dataset_parallel(
+    manager: &Arc<BufferManager>,
+    page_count: usize,
+    worker_count: usize,
+    payload: PayloadDescriptor,
+) -> Result<Vec<Swip>, String> {
+    parallel_collect_ordered(page_count, worker_count, |index| {
+        initialize_page(
+            manager,
+            index,
+            page_count,
+            payload,
+            S3_RESOURCE_RETRY_TIMEOUT,
+        )
+    })
+}
+
+fn initialize_page(
+    manager: &Arc<BufferManager>,
+    index: usize,
+    page_count: usize,
+    payload: PayloadDescriptor,
+    retry_timeout: Duration,
+) -> Result<Swip, String> {
+    let retry_deadline = Instant::now() + retry_timeout;
+    loop {
+        match manager.allocate() {
+            Ok(mut guard) => {
+                guard.write_with(|page| {
+                    fill_page(
+                        page,
+                        index,
+                        payload.shape,
+                        payload.compressibility_pct,
+                        payload.spread_pct,
+                    )
+                });
+                return Ok(guard.swip());
+            }
+            Err(TierBufError::PoolExhausted) if Instant::now() < retry_deadline => {
+                thread::sleep(RESOURCE_RETRY_PAUSE);
+            }
+            Err(TierBufError::PoolExhausted) => {
+                return Err(pool_exhausted_message(&format!(
+                    "initializing logical page {index} of {page_count}"
+                )));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to initialize logical page {index} of {page_count}: {error}"
+                ));
+            }
+        }
+    }
+}
+
+fn parallel_collect_ordered<T, F>(
+    item_count: usize,
+    worker_count: usize,
+    operation: F,
+) -> Result<Vec<T>, String>
+where
+    T: Send,
+    F: Fn(usize) -> Result<T, String> + Sync,
+{
+    if item_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = worker_count.clamp(1, 256).min(item_count);
+    let next_index = AtomicUsize::new(0);
+    let lowest_failure = AtomicUsize::new(item_count);
+    let (sender, receiver) = mpsc::channel::<(usize, Result<T, String>)>();
+
+    thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(worker_count);
+        for worker_id in 0..worker_count {
+            let sender = sender.clone();
+            let operation = &operation;
+            let next_index = &next_index;
+            let lowest_failure = &lowest_failure;
+            workers.push((
+                worker_id,
+                scope.spawn(move || {
+                    loop {
+                        let index = next_index.fetch_add(1, Ordering::Relaxed);
+                        if index >= item_count || index >= lowest_failure.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        let result = panic::catch_unwind(AssertUnwindSafe(|| operation(index)))
+                            .unwrap_or_else(|_| {
+                                Err(format!(
+                                    "dataset initialization panicked at logical page {index}"
+                                ))
+                            });
+                        if result.is_err() {
+                            lowest_failure.fetch_min(index, Ordering::AcqRel);
+                        }
+                        if sender.send((index, result)).is_err() {
+                            break;
+                        }
+                    }
+                }),
+            ));
+        }
+        drop(sender);
+
+        let mut values = std::iter::repeat_with(|| None)
+            .take(item_count)
+            .collect::<Vec<Option<T>>>();
+        let mut failure: Option<(usize, String)> = None;
+        for (index, result) in receiver {
+            match result {
+                Ok(value) => values[index] = Some(value),
+                Err(error)
+                    if failure
+                        .as_ref()
+                        .is_none_or(|(failed_index, _)| index < *failed_index) =>
+                {
+                    failure = Some((index, error));
+                }
+                Err(_) => {}
+            }
+        }
+
+        let first_panicked_worker = workers
+            .into_iter()
+            .filter_map(|(worker_id, worker)| worker.join().err().map(|_| worker_id))
+            .min();
+        if let Some((_, error)) = failure {
+            return Err(error);
+        }
+        if let Some(worker_id) = first_panicked_worker {
+            return Err(format!(
+                "dataset initialization worker {worker_id} panicked"
+            ));
+        }
+
+        values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                value.ok_or_else(|| format!("dataset initialization omitted logical page {index}"))
+            })
+            .collect()
+    })
 }
 
 fn run_phase(
@@ -708,6 +1119,190 @@ fn duration_as_nanos_u64(duration: Duration) -> u64 {
 fn page_marker(index: usize) -> u8 {
     let mixed = index.wrapping_mul(131).wrapping_add(17);
     u8::try_from(mixed % 251 + 1).expect("page marker is in the range 1..=251")
+}
+
+/// Internal structure of one generated benchmark page.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PayloadShape {
+    /// One zero-filled prefix followed by a pseudorandom tail.
+    ///
+    /// Every page shares an identical layout, which keeps results comparable
+    /// with runs recorded before the other shapes existed.
+    #[default]
+    Uniform,
+    /// Alternating variable-length compressible and incompressible runs.
+    ///
+    /// Run boundaries, run lengths, and the repeated token inside each
+    /// compressible run all vary, so LZ4 sees match lengths and literal spans
+    /// closer to real records than a single large zero block does.
+    Chunked,
+}
+
+impl PayloadShape {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Chunked => "chunked",
+        }
+    }
+}
+
+/// Returns the leading zero-filled byte count for one payload compressibility.
+///
+/// The first byte always carries the verification marker, so the result is at
+/// least one byte and at most a whole page.
+fn compressible_prefix_len(compressibility_pct: u8) -> usize {
+    let percent = usize::from(compressibility_pct.min(100));
+    1 + (PAGE_SIZE - 1) * percent / 100
+}
+
+/// Returns a nonzero xorshift state derived from a page index and salt.
+fn payload_state(index: usize, salt: u64) -> u64 {
+    let state = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ salt;
+    // A zero xorshift state would stay zero and silently make one page fully
+    // compressible regardless of the requested percentage.
+    if state == 0 { PAYLOAD_SEED_SALT } else { state }
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Returns the compressibility applied to one page.
+///
+/// With a nonzero spread each page draws its own target from
+/// `[base - spread, base + spread]` clamped to `0..=100`, so one dataset holds
+/// a distribution of compression ratios instead of a single value.
+fn page_compressibility(index: usize, base_pct: u8, spread_pct: u8) -> u8 {
+    let base = base_pct.min(100);
+    if spread_pct == 0 {
+        return base;
+    }
+    let low = base.saturating_sub(spread_pct);
+    let high = base.saturating_add(spread_pct).min(100);
+    let span = u64::from(high - low) + 1;
+    let mut state = payload_state(index, PAYLOAD_SPREAD_SALT);
+    let draw = u8::try_from(next_random(&mut state) % span).unwrap_or(0);
+    low.saturating_add(draw).min(100)
+}
+
+/// Writes the verification marker and a payload with the requested shape.
+///
+/// The marker is always written last so page verification stays independent of
+/// the payload shape, and both shapes touch the whole page so the measured
+/// access cost does not change with the selected structure.
+fn fill_page(
+    page: &mut [u8; PAGE_SIZE],
+    index: usize,
+    shape: PayloadShape,
+    base_pct: u8,
+    spread_pct: u8,
+) {
+    let compressibility_pct = page_compressibility(index, base_pct, spread_pct);
+    match shape {
+        PayloadShape::Uniform => fill_uniform(page, index, compressibility_pct),
+        PayloadShape::Chunked => fill_chunked(page, index, compressibility_pct),
+    }
+    page[0] = page_marker(index);
+}
+
+fn fill_uniform(page: &mut [u8; PAGE_SIZE], index: usize, compressibility_pct: u8) {
+    let prefix = compressible_prefix_len(compressibility_pct);
+    page[..prefix].fill(0);
+
+    let mut state = payload_state(index, PAYLOAD_SEED_SALT);
+    for chunk in page[prefix..].chunks_mut(size_of::<u64>()) {
+        let value = next_random(&mut state);
+        chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+    }
+}
+
+/// Fills one page with alternating compressible and incompressible runs.
+///
+/// A deficit scheduler picks each run's kind by comparing the compressible
+/// bytes written so far against the target share of the bytes emitted so far,
+/// so the achieved ratio converges on `compressibility_pct` while run lengths
+/// stay irregular.
+fn fill_chunked(page: &mut [u8; PAGE_SIZE], index: usize, compressibility_pct: u8) {
+    let mut state = payload_state(index, PAYLOAD_CHUNK_SALT);
+    let target = u64::from(compressibility_pct.min(100));
+    let mut offset = 0;
+    let mut compressible_written = 0_u64;
+
+    while offset < PAGE_SIZE {
+        let span = PAYLOAD_MAX_RUN - PAYLOAD_MIN_RUN + 1;
+        let length =
+            (PAYLOAD_MIN_RUN + (next_random(&mut state) as usize) % span).min(PAGE_SIZE - offset);
+        let emitted = offset as u64;
+        let compressible = compressible_written * 100 < target * emitted.max(1);
+
+        if compressible {
+            // Repeat a short run-specific token. LZ4 collapses this into one
+            // long match, but unlike a zero block each run carries different
+            // literal bytes, which is closer to repeated record fields.
+            let token_len = 1 + (next_random(&mut state) as usize) % PAYLOAD_MAX_TOKEN;
+            let mut token = [0_u8; PAYLOAD_MAX_TOKEN];
+            for byte in token.iter_mut().take(token_len) {
+                *byte = (next_random(&mut state) & 0xff) as u8;
+            }
+            for (position, byte) in page[offset..offset + length].iter_mut().enumerate() {
+                *byte = token[position % token_len];
+            }
+            compressible_written += length as u64;
+        } else {
+            for chunk in page[offset..offset + length].chunks_mut(size_of::<u64>()) {
+                let value = next_random(&mut state);
+                chunk.copy_from_slice(&value.to_le_bytes()[..chunk.len()]);
+            }
+        }
+        offset += length;
+    }
+}
+
+/// LZ4 envelope ratios measured over a sample of generated pages.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CompressionSample {
+    pages: usize,
+    mean: f64,
+    min: f64,
+    max: f64,
+}
+
+/// Returns the LZ4 envelope ratios achieved by a sample of generated pages.
+///
+/// A single page is no longer representative once the shape varies run lengths
+/// or the spread varies compressibility across pages, so the sample reports the
+/// spread of ratios the tier will actually store.
+fn sampled_compression(
+    shape: PayloadShape,
+    base_pct: u8,
+    spread_pct: u8,
+    pages: usize,
+) -> Option<CompressionSample> {
+    let pages = pages.max(1);
+    let mut page = Box::new([0_u8; PAGE_SIZE]);
+    let mut total = 0.0;
+    let mut min = f64::INFINITY;
+    let mut max = 0.0_f64;
+
+    for index in 0..pages {
+        fill_page(&mut page, index, shape, base_pct, spread_pct);
+        let envelope = encode_page(page.as_slice(), PageCodec::Lz4).ok()?;
+        let ratio = envelope.len() as f64 / PAGE_SIZE as f64;
+        total += ratio;
+        min = min.min(ratio);
+        max = max.max(ratio);
+    }
+
+    Some(CompressionSample {
+        pages,
+        mean: total / pages as f64,
+        min,
+        max,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1158,22 +1753,41 @@ impl CsvOutput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DramFraction {
-    tenths: u8,
+    numerator: u8,
+    denominator: u8,
 }
 
 impl DramFraction {
     const fn new(tenths: u8) -> Self {
-        Self { tenths }
+        Self {
+            numerator: tenths,
+            denominator: 10,
+        }
+    }
+
+    const fn ratio(numerator: u8, denominator: u8) -> Self {
+        Self {
+            numerator,
+            denominator,
+        }
     }
 
     fn label(self) -> String {
-        format!("{}.{:01}", self.tenths / 10, self.tenths % 10)
+        match (self.numerator, self.denominator) {
+            (1, 2) => "0.5".to_owned(),
+            (1, 4) => "0.25".to_owned(),
+            (1, 8) => "0.125".to_owned(),
+            (1, 16) => "0.0625".to_owned(),
+            (1, 32) => "0.03125".to_owned(),
+            (tenths, 10) => format!("{}.{:01}", tenths / 10, tenths % 10),
+            _ => format!("{}/{}", self.numerator, self.denominator),
+        }
     }
 
     fn dram_pages(self, dataset_pages: usize) -> Result<usize, String> {
         dataset_pages
-            .checked_mul(usize::from(self.tenths))
-            .map(|pages| (pages / 10).max(1))
+            .checked_mul(usize::from(self.numerator))
+            .map(|pages| (pages / usize::from(self.denominator)).max(1))
             .ok_or_else(|| "DRAM page count overflowed usize".to_owned())
     }
 }
@@ -1185,6 +1799,16 @@ struct DatasetLayout {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct S3BenchConfig {
+    bucket: String,
+    region: String,
+    endpoint: Option<String>,
+    key_prefix: String,
+    compression: bool,
+    capacity_mib: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Config {
     dataset_mib: u64,
     warmup: Duration,
@@ -1192,8 +1816,15 @@ struct Config {
     workers: usize,
     mock_latency_us: u64,
     prefetch_scan: bool,
+    prefetch_workers: usize,
+    prefetch_in_flight: usize,
     scan_only: bool,
     file_tier: Option<PathBuf>,
+    file_compression: bool,
+    payload_shape: PayloadShape,
+    payload_compressibility_pct: u8,
+    payload_spread_pct: u8,
+    s3: Option<S3BenchConfig>,
     output: PathBuf,
     stats_output: PathBuf,
     fractions: Vec<DramFraction>,
@@ -1209,8 +1840,15 @@ impl Default for Config {
             workers: DEFAULT_WORKERS,
             mock_latency_us: DEFAULT_MOCK_LATENCY_US,
             prefetch_scan: false,
+            prefetch_workers: DEFAULT_PREFETCH_WORKERS,
+            prefetch_in_flight: DEFAULT_PREFETCH_IN_FLIGHT,
             scan_only: false,
             file_tier: None,
+            file_compression: false,
+            payload_shape: PayloadShape::Uniform,
+            payload_compressibility_pct: DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
+            payload_spread_pct: 0,
+            s3: None,
             output: PathBuf::from(DEFAULT_OUTPUT),
             stats_output: PathBuf::from(DEFAULT_STATS_OUTPUT),
             fractions: DRAM_FRACTIONS.to_vec(),
@@ -1245,7 +1883,7 @@ impl Config {
             .ok_or_else(|| "--dataset-mib is too large".to_owned())?;
         let tier_capacity_bytes = dataset_bytes
             .checked_mul(2)
-            .ok_or_else(|| "--dataset-mib is too large for a 2x MockTier".to_owned())?;
+            .ok_or_else(|| "--dataset-mib is too large for a 2x lower tier".to_owned())?;
         let dataset_bytes_usize = usize::try_from(dataset_bytes)
             .map_err(|_| "--dataset-mib does not fit this platform's address space".to_owned())?;
         let page_count = dataset_bytes_usize / PAGE_SIZE;
@@ -1273,6 +1911,12 @@ impl Config {
         if self.workers == 0 {
             return Err("--workers must be greater than zero".to_owned());
         }
+        if !(1..=256).contains(&self.prefetch_workers) {
+            return Err("--prefetch-workers must be within 1..=256".to_owned());
+        }
+        if self.prefetch_in_flight < self.prefetch_workers || self.prefetch_in_flight > 4096 {
+            return Err("--prefetch-in-flight must be within prefetch-workers..=4096".to_owned());
+        }
         if self.output.as_os_str().is_empty() {
             return Err("--output must not be empty".to_owned());
         }
@@ -1289,6 +1933,26 @@ impl Config {
         {
             return Err("--file-tier must not be empty".to_owned());
         }
+        if let Some(s3) = &self.s3 {
+            if s3.bucket.is_empty() {
+                return Err("--s3-bucket must not be empty".to_owned());
+            }
+            if s3.region.is_empty() {
+                return Err("--s3-region must not be empty".to_owned());
+            }
+            if s3.endpoint.as_ref().is_some_and(String::is_empty) {
+                return Err("--s3-endpoint must not be empty".to_owned());
+            }
+            if s3.key_prefix.is_empty() || s3.key_prefix.starts_with('/') {
+                return Err("--s3-prefix must be non-empty and bucket-relative".to_owned());
+            }
+            if s3.capacity_mib == 0 {
+                return Err("--s3-capacity-mib must be greater than zero".to_owned());
+            }
+            s3.capacity_mib
+                .checked_mul(MIB)
+                .ok_or_else(|| "--s3-capacity-mib is too large".to_owned())?;
+        }
         self.dataset_layout().map(|_| ())
     }
 }
@@ -1302,7 +1966,7 @@ enum Profile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CliAction {
     Help,
-    Run(Config),
+    Run(Box<Config>),
 }
 
 fn parse_cli<I, S>(arguments: I) -> Result<CliAction, String>
@@ -1317,9 +1981,21 @@ where
     let mut measurement = None;
     let mut workers = None;
     let mut mock_latency_us = None;
+    let mut prefetch_workers = None;
+    let mut prefetch_in_flight = None;
     let mut prefetch_scan = false;
     let mut scan_only = false;
     let mut file_tier = None;
+    let mut file_compression = None;
+    let mut payload_shape = None;
+    let mut payload_compressibility = None;
+    let mut payload_spread = None;
+    let mut s3_bucket = None;
+    let mut s3_region = None;
+    let mut s3_endpoint = None;
+    let mut s3_prefix = None;
+    let mut s3_compression = None;
+    let mut s3_capacity_mib = None;
     let mut output = None;
     let mut stats_output = None;
     let mut fraction = None;
@@ -1373,8 +2049,44 @@ where
             "--mock-latency-us" => {
                 mock_latency_us = Some(parse_u64(&next_value()?, flag)?);
             }
+            "--prefetch-workers" => {
+                prefetch_workers = Some(parse_usize(&next_value()?, flag)?);
+            }
+            "--prefetch-in-flight" => {
+                prefetch_in_flight = Some(parse_usize(&next_value()?, flag)?);
+            }
             "--file-tier" => {
                 file_tier = Some(PathBuf::from(next_value()?));
+            }
+            "--file-compression" => {
+                file_compression = Some(parse_toggle(&next_value()?, flag)?);
+            }
+            "--payload-shape" => {
+                payload_shape = Some(parse_payload_shape(&next_value()?, flag)?);
+            }
+            "--payload-compressibility" => {
+                payload_compressibility = Some(parse_percentage(&next_value()?, flag)?);
+            }
+            "--payload-spread" => {
+                payload_spread = Some(parse_percentage(&next_value()?, flag)?);
+            }
+            "--s3-bucket" => {
+                s3_bucket = Some(next_value()?);
+            }
+            "--s3-region" => {
+                s3_region = Some(next_value()?);
+            }
+            "--s3-endpoint" => {
+                s3_endpoint = Some(next_value()?);
+            }
+            "--s3-prefix" => {
+                s3_prefix = Some(next_value()?);
+            }
+            "--s3-compression" => {
+                s3_compression = Some(parse_toggle(&next_value()?, flag)?);
+            }
+            "--s3-capacity-mib" => {
+                s3_capacity_mib = Some(parse_u64(&next_value()?, flag)?);
             }
             "--output" => {
                 output = Some(PathBuf::from(next_value()?));
@@ -1399,6 +2111,23 @@ where
         }
     }
 
+    if file_tier.is_none() && file_compression.is_some() {
+        return Err("--file-compression requires --file-tier".to_owned());
+    }
+    if s3_bucket.is_none() {
+        for (flag, supplied) in [
+            ("--s3-region", s3_region.is_some()),
+            ("--s3-endpoint", s3_endpoint.is_some()),
+            ("--s3-prefix", s3_prefix.is_some()),
+            ("--s3-compression", s3_compression.is_some()),
+            ("--s3-capacity-mib", s3_capacity_mib.is_some()),
+        ] {
+            if supplied {
+                return Err(format!("{flag} requires --s3-bucket"));
+            }
+        }
+    }
+
     let mut config = match profile {
         Some(Profile::Quick) => Config::quick(),
         Some(Profile::Ci) => Config::ci(),
@@ -1419,10 +2148,47 @@ where
     if let Some(value) = mock_latency_us {
         config.mock_latency_us = value;
     }
+    let has_s3 = s3_bucket.is_some();
+    config.prefetch_workers = prefetch_workers.unwrap_or(if has_s3 {
+        DEFAULT_S3_PREFETCH_WORKERS
+    } else {
+        DEFAULT_PREFETCH_WORKERS
+    });
+    config.prefetch_in_flight = prefetch_in_flight.unwrap_or(if has_s3 {
+        DEFAULT_S3_PREFETCH_IN_FLIGHT
+    } else {
+        DEFAULT_PREFETCH_IN_FLIGHT
+    });
     config.prefetch_scan = prefetch_scan;
     config.scan_only = scan_only;
     if let Some(value) = file_tier {
         config.file_tier = Some(value);
+    }
+    config.file_compression = file_compression.unwrap_or(false);
+    if let Some(value) = payload_shape {
+        config.payload_shape = value;
+    }
+    if let Some(value) = payload_compressibility {
+        config.payload_compressibility_pct = value;
+    }
+    if let Some(value) = payload_spread {
+        config.payload_spread_pct = value;
+    }
+    if let Some(bucket) = s3_bucket {
+        let capacity_mib = match s3_capacity_mib {
+            Some(capacity_mib) => capacity_mib,
+            None => config.dataset_mib.checked_mul(2).ok_or_else(|| {
+                "--dataset-mib is too large for the default S3 capacity".to_owned()
+            })?,
+        };
+        config.s3 = Some(S3BenchConfig {
+            bucket,
+            region: s3_region.unwrap_or_else(|| DEFAULT_S3_REGION.to_owned()),
+            endpoint: s3_endpoint,
+            key_prefix: s3_prefix.unwrap_or_else(default_s3_prefix),
+            compression: s3_compression.unwrap_or(true),
+            capacity_mib,
+        });
     }
     if let Some(value) = output {
         config.output = value;
@@ -1437,17 +2203,64 @@ where
         config.eviction_mode = value;
     }
     config.validate()?;
-    Ok(CliAction::Run(config))
+    Ok(CliAction::Run(Box::new(config)))
 }
 
 fn parse_fraction(value: &str, flag: &str) -> Result<DramFraction, String> {
-    DRAM_FRACTIONS
+    let fraction = DRAM_FRACTIONS
         .iter()
         .copied()
         .find(|fraction| fraction.label() == value)
-        .ok_or_else(|| {
-            format!("{flag} expects one of 1.0, 0.8, 0.6, 0.4, 0.2, or 0.1; got '{value}'")
-        })
+        .or_else(|| match value {
+            "0.5" => Some(DramFraction::ratio(1, 2)),
+            "0.25" => Some(DramFraction::ratio(1, 4)),
+            "0.125" => Some(DramFraction::ratio(1, 8)),
+            "0.0625" => Some(DramFraction::ratio(1, 16)),
+            "0.03125" => Some(DramFraction::ratio(1, 32)),
+            _ => None,
+        });
+    fraction.ok_or_else(|| {
+        format!(
+            "{flag} expects 1.0, 0.8, 0.6, 0.5, 0.4, 0.25, 0.2, 0.125, \
+             0.1, 0.0625, or 0.03125; got '{value}'"
+        )
+    })
+}
+
+fn parse_toggle(value: &str, flag: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("{flag} expects 'on' or 'off'; got '{value}'")),
+    }
+}
+
+fn parse_payload_shape(value: &str, flag: &str) -> Result<PayloadShape, String> {
+    match value {
+        "uniform" => Ok(PayloadShape::Uniform),
+        "chunked" => Ok(PayloadShape::Chunked),
+        _ => Err(format!(
+            "{flag} expects 'uniform' or 'chunked'; got '{value}'"
+        )),
+    }
+}
+
+fn parse_percentage(value: &str, flag: &str) -> Result<u8, String> {
+    let percent: u16 = value
+        .parse()
+        .map_err(|_| format!("{flag} expects a whole percentage, got '{value}'"))?;
+    if percent > 100 {
+        return Err(format!("{flag} must be within 0..=100; got '{value}'"));
+    }
+    u8::try_from(percent).map_err(|_| format!("{flag} must be within 0..=100; got '{value}'"))
+}
+
+fn default_s3_prefix() -> String {
+    let unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("tierbuf-bench/{unix_secs}-{}/", std::process::id())
 }
 
 fn parse_eviction_mode(value: &str, flag: &str) -> Result<EvictionMode, String> {
@@ -1511,11 +2324,28 @@ Options:
     --workers N             Worker threads (default: 4)
     --mock-latency-us N     MockTier read/write delay in microseconds (default: 80)
     --prefetch-scan         Prefetch eight pages ahead during sequential scans
+    --prefetch-workers N    Background prefetch workers (default: S3 64, otherwise 4)
+    --prefetch-in-flight N  Queued-plus-running prefetch limit (default: S3 256, otherwise 128)
     --scan-only             Run the sequential scan component only
-    --file-tier PATH        Use one reusable FileTier path instead of MockTier
+    --file-tier PATH        Use a reusable FileTier; precedes S3 when both are set
+    --file-compression MODE FileTier LZ4 slot compression: on or off (default);
+                            'on' also disables the io_uring read path
+    --payload-shape SHAPE   Page structure: uniform (default) one zero prefix
+                            plus a random tail, or chunked variable-length runs
+    --payload-compressibility PCT
+                            Target percent of each page that is compressible;
+                            0 is incompressible (default: 100)
+    --payload-spread PCT    Per-page compressibility variation around the target,
+                            so one dataset holds a distribution (default: 0)
+    --s3-bucket NAME        Enable an S3 tier for this bucket
+    --s3-region REGION      S3 signing region (default: us-east-1)
+    --s3-endpoint URL       Custom path-style endpoint for MinIO or LocalStack
+    --s3-prefix PREFIX      Object prefix (default: tierbuf-bench/{{unix_secs}}-{{pid}}/)
+    --s3-compression MODE   S3 envelope compression: on (default) or off
+    --s3-capacity-mib N     Logical S3 capacity in MiB (default: 2x dataset)
     --output PATH           CSV output path, replaced each run (default: results/curve.csv)
     --stats-output PATH     JSON stats output path (default: results/stats.json)
-    --fraction FRACTION     Run one DRAM fraction: 1.0, 0.8, 0.6, 0.4, 0.2, or 0.1
+    --fraction FRACTION     Run one supported DRAM fraction instead of the default sweep
     --eviction-mode MODE    Background eviction mode: demand (default) or watermark
     -h, --help              Show this help
 
@@ -1527,21 +2357,87 @@ Explicit sizing and duration options override the selected profile."
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
     use std::time::Duration;
 
     use tierbuf::PAGE_SIZE;
     use tierbuf::metrics::{TierCounters, TierStats};
     use tierbuf::policy::AccessHint;
+    use tierbuf::pool::{BufConfig, BufferManager};
+    use tierbuf::tier::mock::MockTier;
+    use tierbuf::tier::s3::S3TierStats;
+    use tierbuf::tier::s3::client::MemoryObjectApi;
+    use tierbuf::tier::s3::credentials::CredentialSource;
+    use tierbuf::tier::{LatencyProfile, TierBackend, TierOffset, WriteBudget};
 
     use super::{
-        BenchRow, CSV_HEADER, CliAction, Config, CsvOutput, DramFraction, EvictionMode,
-        POINT_ACCESS_PERCENT, PhaseResult, WorkloadState, ZipfSampler, format_csv_row, parse_cli,
-        percentile,
+        BenchRow, CSV_HEADER, CliAction, Config, CsvOutput, DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
+        DramFraction, EvictionMode, POINT_ACCESS_PERCENT, PayloadDescriptor, PayloadShape,
+        PhaseResult, TierKind, WorkloadState, ZipfSampler, compressible_prefix_len, fill_page,
+        format_csv_row, fraction_stats_json, initialize_dataset_parallel, page_compressibility,
+        page_marker, parallel_collect_ordered, parse_cli, percentile, s3_client_config,
+        s3_stats_json, sampled_compression, smoke_object_api, tier_plan,
     };
+
+    #[derive(Clone, Default)]
+    struct WriteConcurrencyProbe {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+
+    struct SlowWriteTier {
+        inner: MockTier,
+        probe: WriteConcurrencyProbe,
+    }
+
+    impl TierBackend for SlowWriteTier {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn read(&self, location: TierOffset, buffer: &mut [u8]) -> tierbuf::Result<()> {
+            self.inner.read(location, buffer)
+        }
+
+        fn write(&self, buffer: &[u8]) -> tierbuf::Result<TierOffset> {
+            let active = self.probe.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.probe.peak.fetch_max(active, Ordering::AcqRel);
+            thread::sleep(Duration::from_millis(5));
+            let result = self.inner.write(buffer);
+            self.probe.active.fetch_sub(1, Ordering::AcqRel);
+            result
+        }
+
+        fn free(&self, location: TierOffset) {
+            self.inner.free(location);
+        }
+
+        fn capacity_bytes(&self) -> u64 {
+            self.inner.capacity_bytes()
+        }
+
+        fn used_bytes(&self) -> u64 {
+            self.inner.used_bytes()
+        }
+
+        fn price_gb_month(&self) -> f64 {
+            self.inner.price_gb_month()
+        }
+
+        fn write_budget(&self) -> Option<&WriteBudget> {
+            self.inner.write_budget()
+        }
+
+        fn latency(&self) -> LatencyProfile {
+            self.inner.latency()
+        }
+    }
 
     fn run_config(arguments: &[&str]) -> Config {
         match parse_cli(arguments.iter().copied()).expect("valid CLI") {
-            CliAction::Run(config) => config,
+            CliAction::Run(config) => *config,
             CliAction::Help => panic!("expected a runnable configuration"),
         }
     }
@@ -1555,6 +2451,8 @@ mod tests {
         assert_eq!(quick.warmup, Duration::from_secs(1));
         assert_eq!(quick.measurement, Duration::from_secs(5));
         assert_eq!(quick.workers, 4);
+        assert_eq!(quick.prefetch_workers, 4);
+        assert_eq!(quick.prefetch_in_flight, 128);
 
         let ci = run_config(&["--ci"]);
         assert_eq!(ci.dataset_mib, 32);
@@ -1575,6 +2473,8 @@ mod tests {
             "2",
             "--mock-latency-us=7",
             "--prefetch-scan",
+            "--prefetch-workers=8",
+            "--prefetch-in-flight=64",
             "--scan-only",
             "--file-tier",
             "/tmp/tierbuf-bench-test.bin",
@@ -1593,6 +2493,8 @@ mod tests {
         assert_eq!(config.workers, 2);
         assert_eq!(config.mock_latency_us, 7);
         assert!(config.prefetch_scan);
+        assert_eq!(config.prefetch_workers, 8);
+        assert_eq!(config.prefetch_in_flight, 64);
         assert!(config.scan_only);
         assert_eq!(
             config.file_tier,
@@ -1609,10 +2511,13 @@ mod tests {
             vec!["--warmup-secs", "NaN"],
             vec!["--measure-secs", "0"],
             vec!["--workers", "0"],
+            vec!["--prefetch-workers", "0"],
+            vec!["--prefetch-workers", "129", "--prefetch-in-flight", "128"],
+            vec!["--prefetch-in-flight", "4097"],
             vec!["--file-tier="],
             vec!["--output="],
             vec!["--stats-output="],
-            vec!["--fraction", "0.5"],
+            vec!["--fraction", "0.333"],
             vec!["--eviction-mode", "periodic"],
             vec!["--unknown"],
             vec!["--workers"],
@@ -1622,6 +2527,457 @@ mod tests {
                 "arguments should be rejected: {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn s3_cli_flags_round_trip_and_select_prefetch_defaults() {
+        let config = run_config(&[
+            "--dataset-mib",
+            "64",
+            "--s3-bucket",
+            "bench-bucket",
+            "--s3-region",
+            "ap-northeast-1",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-prefix",
+            "custom/run",
+            "--s3-compression",
+            "off",
+            "--s3-capacity-mib",
+            "256",
+        ]);
+        let s3 = config.s3.as_ref().expect("S3 configuration");
+        assert_eq!(s3.bucket, "bench-bucket");
+        assert_eq!(s3.region, "ap-northeast-1");
+        assert_eq!(s3.endpoint.as_deref(), Some("http://127.0.0.1:9000"));
+        assert_eq!(s3.key_prefix, "custom/run");
+        assert!(!s3.compression);
+        assert_eq!(s3.capacity_mib, 256);
+        assert_eq!(config.prefetch_workers, 64);
+        assert_eq!(config.prefetch_in_flight, 256);
+
+        let defaults = run_config(&["--s3-bucket", "bench-bucket"]);
+        let default_s3 = defaults.s3.as_ref().expect("default S3 configuration");
+        assert_eq!(default_s3.region, "us-east-1");
+        assert!(default_s3.endpoint.is_none());
+        assert!(default_s3.compression);
+        assert_eq!(default_s3.capacity_mib, defaults.dataset_mib * 2);
+        assert!(default_s3.key_prefix.starts_with("tierbuf-bench/"));
+        assert!(default_s3.key_prefix.ends_with('/'));
+
+        let explicit_prefetch = run_config(&[
+            "--s3-bucket",
+            "bench-bucket",
+            "--prefetch-workers",
+            "12",
+            "--prefetch-in-flight",
+            "48",
+        ]);
+        assert_eq!(explicit_prefetch.prefetch_workers, 12);
+        assert_eq!(explicit_prefetch.prefetch_in_flight, 48);
+    }
+
+    #[test]
+    fn s3_only_flags_require_a_bucket_and_compression_is_strict() {
+        for invalid in [
+            vec!["--s3-region", "us-west-2"],
+            vec!["--s3-endpoint", "http://127.0.0.1:9000"],
+            vec!["--s3-prefix", "run/"],
+            vec!["--s3-compression", "off"],
+            vec!["--s3-capacity-mib", "32"],
+            vec!["--s3-bucket", "bucket", "--s3-compression", "maybe"],
+            vec!["--s3-bucket="],
+            vec!["--s3-bucket", "bucket", "--s3-prefix="],
+            vec!["--s3-bucket", "bucket", "--s3-capacity-mib", "0"],
+        ] {
+            assert!(
+                parse_cli(invalid.iter().copied()).is_err(),
+                "arguments should be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_compression_flags_round_trip_and_require_a_file_tier() {
+        let config = run_config(&[
+            "--file-tier",
+            "/tmp/tierbuf-file",
+            "--file-compression",
+            "on",
+            "--payload-compressibility",
+            "40",
+        ]);
+        assert!(config.file_compression);
+        assert_eq!(config.payload_compressibility_pct, 40);
+
+        let shaped = run_config(&[
+            "--payload-shape",
+            "chunked",
+            "--payload-compressibility",
+            "60",
+            "--payload-spread",
+            "25",
+        ]);
+        assert_eq!(shaped.payload_shape, PayloadShape::Chunked);
+        assert_eq!(shaped.payload_compressibility_pct, 60);
+        assert_eq!(shaped.payload_spread_pct, 25);
+
+        let defaults = run_config(&["--file-tier", "/tmp/tierbuf-file"]);
+        assert!(!defaults.file_compression);
+        assert_eq!(
+            defaults.payload_compressibility_pct,
+            DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT
+        );
+        assert_eq!(defaults.payload_shape, PayloadShape::Uniform);
+        assert_eq!(defaults.payload_spread_pct, 0);
+
+        // The payload shape is tier-independent, so it is valid on its own.
+        assert_eq!(
+            run_config(&["--payload-compressibility", "0"]).payload_compressibility_pct,
+            0
+        );
+
+        for invalid in [
+            vec!["--file-compression", "on"],
+            vec![
+                "--file-tier",
+                "/tmp/tierbuf-file",
+                "--file-compression",
+                "yes",
+            ],
+            vec!["--payload-shape", "random"],
+            vec!["--payload-spread", "101"],
+            vec!["--payload-compressibility", "101"],
+            vec!["--payload-compressibility", "-1"],
+            vec!["--payload-compressibility", "half"],
+        ] {
+            assert!(
+                parse_cli(invalid.iter().copied()).is_err(),
+                "arguments should be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_compressibility_spans_incompressible_to_all_zero() {
+        let mut page = Box::new([0_u8; PAGE_SIZE]);
+
+        fill_page(&mut page, 7, PayloadShape::Uniform, 100, 0);
+        assert_eq!(page[0], page_marker(7));
+        assert!(
+            page[1..].iter().all(|byte| *byte == 0),
+            "a fully compressible page keeps the historical all-zero payload"
+        );
+
+        fill_page(&mut page, 7, PayloadShape::Uniform, 0, 0);
+        assert_eq!(page[0], page_marker(7));
+        let nonzero = page[1..].iter().filter(|byte| **byte != 0).count();
+        assert!(
+            nonzero > (PAGE_SIZE - 1) / 2,
+            "an incompressible page should be mostly nonzero, saw {nonzero}"
+        );
+
+        // The prefix boundary is exact, so a mid sweep splits the page.
+        fill_page(&mut page, 7, PayloadShape::Uniform, 50, 0);
+        let prefix = compressible_prefix_len(50);
+        assert!(page[1..prefix].iter().all(|byte| *byte == 0));
+        assert!(page[prefix..].iter().any(|byte| *byte != 0));
+    }
+
+    fn sample(shape: PayloadShape, base: u8, spread: u8) -> super::CompressionSample {
+        sampled_compression(shape, base, spread, 32).expect("LZ4 sampling requires the lz4 feature")
+    }
+
+    #[test]
+    fn sampled_compression_ratio_decreases_with_compressibility() {
+        for shape in [PayloadShape::Uniform, PayloadShape::Chunked] {
+            let incompressible = sample(shape, 0, 0).mean;
+            let mixed = sample(shape, 50, 0).mean;
+            let compressible = sample(shape, 100, 0).mean;
+
+            assert!(
+                compressible < mixed && mixed < incompressible,
+                "{}: ratios should fall as compressibility rises: \
+                 {compressible} < {mixed} < {incompressible}",
+                shape.label()
+            );
+            assert!(
+                incompressible >= 1.0,
+                "{}: random payloads must fall back to verbatim storage, got {incompressible}",
+                shape.label()
+            );
+        }
+
+        assert!(
+            sample(PayloadShape::Uniform, 100, 0).mean < 0.05,
+            "all-zero payloads should compress hard"
+        );
+    }
+
+    #[test]
+    fn chunked_pages_vary_while_uniform_pages_do_not() {
+        let uniform = sample(PayloadShape::Uniform, 50, 0);
+        let chunked = sample(PayloadShape::Chunked, 50, 0);
+
+        // Every uniform page has an identical layout, so all ratios match.
+        assert_eq!(
+            uniform.min, uniform.max,
+            "uniform pages should all compress identically"
+        );
+        assert!(
+            chunked.max > chunked.min,
+            "chunked run lengths should produce a range of ratios, got {}..{}",
+            chunked.min,
+            chunked.max
+        );
+        assert_eq!(chunked.pages, 32);
+    }
+
+    #[test]
+    fn spread_widens_the_ratio_distribution() {
+        let tight = sample(PayloadShape::Uniform, 50, 0);
+        let wide = sample(PayloadShape::Uniform, 50, 40);
+
+        assert!(
+            wide.max - wide.min > tight.max - tight.min,
+            "spread should widen the ratio range: {}..{} vs {}..{}",
+            wide.min,
+            wide.max,
+            tight.min,
+            tight.max
+        );
+    }
+
+    #[test]
+    fn page_compressibility_is_deterministic_and_bounded() {
+        // Zero spread pins every page to the requested target.
+        for index in [0, 1, 999] {
+            assert_eq!(page_compressibility(index, 60, 0), 60);
+        }
+
+        let mut seen_low = false;
+        let mut seen_high = false;
+        for index in 0..512 {
+            let drawn = page_compressibility(index, 50, 30);
+            assert!(
+                (20..=80).contains(&drawn),
+                "page {index} drew {drawn} outside the spread window"
+            );
+            assert_eq!(
+                drawn,
+                page_compressibility(index, 50, 30),
+                "page {index} must draw deterministically"
+            );
+            seen_low |= drawn < 50;
+            seen_high |= drawn > 50;
+        }
+        assert!(seen_low && seen_high, "spread should draw both directions");
+
+        // Clamping keeps the window inside 0..=100 at the extremes.
+        for index in 0..64 {
+            assert!(page_compressibility(index, 95, 30) <= 100);
+            assert!(page_compressibility(index, 5, 30) <= 35);
+        }
+    }
+
+    #[test]
+    fn tier_plan_preserves_file_then_s3_order() {
+        assert_eq!(tier_plan(&run_config(&[])), vec![TierKind::Mock]);
+        assert_eq!(
+            tier_plan(&run_config(&["--file-tier", "/tmp/tierbuf-file"])),
+            vec![TierKind::File]
+        );
+        assert_eq!(
+            tier_plan(&run_config(&["--s3-bucket", "bucket"])),
+            vec![TierKind::S3]
+        );
+        assert_eq!(
+            tier_plan(&run_config(&[
+                "--file-tier",
+                "/tmp/tierbuf-file",
+                "--s3-bucket",
+                "bucket",
+            ])),
+            vec![TierKind::File, TierKind::S3]
+        );
+    }
+
+    #[test]
+    fn s3_client_config_uses_auto_credentials() {
+        let config = run_config(&[
+            "--s3-bucket",
+            "bucket",
+            "--s3-region",
+            "us-west-2",
+            "--s3-endpoint",
+            "http://localhost:9000",
+        ]);
+        let client = s3_client_config(config.s3.as_ref().expect("S3 configuration"));
+        assert_eq!(client.bucket, "bucket");
+        assert_eq!(client.region, "us-west-2");
+        assert_eq!(client.endpoint.as_deref(), Some("http://localhost:9000"));
+        assert!(matches!(client.credentials, CredentialSource::Auto));
+    }
+
+    #[test]
+    fn demo_fractions_parse_and_size_exactly() {
+        for (value, expected_pages) in [
+            ("1.0", 1_024),
+            ("0.5", 512),
+            ("0.25", 256),
+            ("0.125", 128),
+            ("0.0625", 64),
+            ("0.03125", 32),
+        ] {
+            let fraction = run_config(&["--fraction", value]).fractions[0];
+            assert_eq!(fraction.label(), value);
+            assert_eq!(
+                fraction.dram_pages(1_024).expect("valid page count"),
+                expected_pages
+            );
+        }
+    }
+
+    #[test]
+    fn object_api_smoke_round_trips_without_network() {
+        let api = MemoryObjectApi::new();
+        smoke_object_api(&api, "bench").expect("smoke test");
+        let stats = api.snapshot();
+        assert_eq!(stats.put_requests, 1);
+        assert_eq!(stats.get_requests, 1);
+        assert_eq!(stats.delete_requests, 1);
+    }
+
+    #[test]
+    fn parallel_collection_preserves_order_and_lowest_index_error() {
+        let values = parallel_collect_ordered(32, 8, |index| {
+            thread::sleep(Duration::from_micros(
+                u64::try_from(31 - index).expect("small index") * 10,
+            ));
+            Ok(index * 3)
+        })
+        .expect("parallel collection");
+        assert_eq!(values, (0..32).map(|index| index * 3).collect::<Vec<_>>());
+
+        let error = parallel_collect_ordered::<usize, _>(32, 8, |index| match index {
+            3 => {
+                thread::sleep(Duration::from_millis(5));
+                Err("logical page 3 failed".to_owned())
+            }
+            11 => Err("logical page 11 failed".to_owned()),
+            _ => Ok(index),
+        })
+        .expect_err("injected errors must propagate");
+        assert_eq!(error, "logical page 3 failed");
+    }
+
+    #[test]
+    fn parallel_dataset_initialization_preserves_markers_and_swip_order() {
+        let manager = BufferManager::new(BufConfig {
+            dram_pool_bytes: 8 * PAGE_SIZE,
+            tiers: vec![Box::new(
+                MockTier::new(128 * PAGE_SIZE as u64).expect("mock tier"),
+            )],
+            prefetch_workers: 4,
+            max_prefetch_in_flight: 16,
+            ..BufConfig::default()
+        })
+        .expect("buffer manager");
+
+        let swips = initialize_dataset_parallel(&manager, 64, 8, PayloadDescriptor::default())
+            .expect("parallel initialization");
+        assert_eq!(swips.len(), 64);
+        for (index, swip) in swips.iter().enumerate() {
+            let guard = manager.fix_shared(swip).expect("initialized page");
+            assert_eq!(guard.read_with(|page| page[0]), page_marker(index));
+        }
+
+        Arc::clone(&manager).shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn parallel_dataset_initialization_drives_bounded_concurrent_tier_writes() {
+        let probe = WriteConcurrencyProbe::default();
+        let manager = BufferManager::new(BufConfig {
+            dram_pool_bytes: 8 * PAGE_SIZE,
+            cooling_ratio: 0.0,
+            tiers: vec![Box::new(SlowWriteTier {
+                inner: MockTier::new(128 * PAGE_SIZE as u64).expect("mock tier"),
+                probe: probe.clone(),
+            })],
+            prefetch_workers: 4,
+            max_prefetch_in_flight: 16,
+            ..BufConfig::default()
+        })
+        .expect("buffer manager");
+
+        let swips = initialize_dataset_parallel(&manager, 64, 8, PayloadDescriptor::default())
+            .expect("parallel initialization");
+        assert_eq!(swips.len(), 64);
+        let peak = probe.peak.load(Ordering::Acquire);
+        assert!(peak > 1, "expected concurrent tier writes, observed {peak}");
+        assert!(peak <= 8, "initializer exceeded its worker bound: {peak}");
+
+        Arc::clone(&manager).shutdown().expect("clean shutdown");
+    }
+
+    #[test]
+    fn s3_stats_json_reports_compression_and_zero_logical_as_null() {
+        let value = s3_stats_json(S3TierStats {
+            get_requests: 3,
+            put_requests: 4,
+            delete_requests: 1,
+            request_failures: 0,
+            stored_bytes: 32,
+            logical_bytes: 64,
+            bytes_uploaded: 96,
+            bytes_downloaded: 64,
+        });
+        assert_eq!(value["get_requests"], 3);
+        assert_eq!(value["compression_ratio"], 0.5);
+
+        let empty = s3_stats_json(S3TierStats::default());
+        assert!(empty["compression_ratio"].is_null());
+    }
+
+    #[test]
+    fn fraction_stats_embed_s3_at_the_run_top_level() {
+        let before = test_stats(1, 2);
+        let after = test_stats(3, 5);
+        let measured = PhaseResult {
+            operations: 5,
+            point_operations: 3,
+            scan_operations: 2,
+            point_dram_hits: 1,
+            scan_dram_hits: 1,
+            elapsed: Duration::from_secs(1),
+            latencies_ns: Vec::new(),
+            point_latencies_ns: Vec::new(),
+            scan_latencies_ns: Vec::new(),
+        };
+        let value = fraction_stats_json(
+            DramFraction::ratio(1, 2),
+            &measured,
+            &before,
+            &after,
+            Some(S3TierStats {
+                stored_bytes: 16,
+                logical_bytes: 64,
+                ..S3TierStats::default()
+            }),
+            PayloadDescriptor {
+                shape: PayloadShape::Uniform,
+                compressibility_pct: 100,
+                spread_pct: 0,
+                file_compression: false,
+            },
+        )
+        .expect("valid stats delta");
+
+        assert_eq!(value["fraction"], "0.5");
+        assert_eq!(value["s3"]["stored_bytes"], 16);
+        assert_eq!(value["s3"]["compression_ratio"], 0.25);
     }
 
     #[test]

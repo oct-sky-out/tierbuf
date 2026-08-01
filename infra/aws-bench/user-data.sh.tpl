@@ -3,15 +3,28 @@
 set -uo pipefail
 exec > /var/log/tierbuf-bench.log 2>&1
 
+# cloud-init runs user-data as root without exporting HOME. rustup's
+# generated /root/.cargo/env references $HOME, so `set -u` kills the script
+# the instant it's sourced unless HOME is set explicitly first.
+export HOME=/root
+
 decode() {
   printf '%s' "$1" | base64 --decode
 }
 
 RUN_ID=$(decode "__RUN_ID_B64__")
 BUCKET=$(decode "__BUCKET_B64__")
+BENCH_S3_BUCKET=$(decode "__BENCH_S3_BUCKET_B64__")
+BENCH_S3_REGION=$(decode "__BENCH_S3_REGION_B64__")
 REPO_URL=$(decode "__REPO_URL_B64__")
 REPO_BRANCH=$(decode "__REPO_BRANCH_B64__")
 BENCH_ARGS=$(decode "__BENCH_ARGS_B64__")
+FILE_COMPRESSION_DEMO=$(decode "__FILE_COMPRESSION_DEMO_B64__")
+FILE_COMPRESSION_PCTS=$(decode "__FILE_COMPRESSION_PCTS_B64__")
+FILE_COMPRESSION_DATASET_MIB=$(decode "__FILE_COMPRESSION_DATASET_MIB_B64__")
+FILE_COMPRESSION_FRACTION=$(decode "__FILE_COMPRESSION_FRACTION_B64__")
+FILE_COMPRESSION_SHAPES=$(decode "__FILE_COMPRESSION_SHAPES_B64__")
+FILE_COMPRESSION_SPREAD=$(decode "__FILE_COMPRESSION_SPREAD_B64__")
 MAX_MINUTES="__MAX_MINUTES__"
 BENCH_SUCCEEDED=0
 
@@ -47,7 +60,7 @@ set -e
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y build-essential pkg-config curl unzip git xfsprogs fio
+apt-get install -y build-essential pkg-config curl unzip git xfsprogs fio python3
 
 curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip \
   -o /tmp/awscliv2.zip
@@ -69,7 +82,7 @@ fio --name=baseline --filename=/mnt/nvme/fio.test --rw=randread --bs=64k \
 rm -f /mnt/nvme/fio.test
 
 curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal \
-  --default-toolchain 1.88.0
+  --default-toolchain 1.97.1
 # shellcheck source=/dev/null
 source /root/.cargo/env
 
@@ -84,6 +97,32 @@ mkdir -p /tmp/results /mnt/nvme/tier
 ./target/release/tierbuf-bench ${BENCH_ARGS} \
   --file-tier /mnt/nvme/tier/tierbuf.bin \
   --output /tmp/results/curve.csv
+
+if [ -n "${FILE_COMPRESSION_DEMO}" ]; then
+  # NVMe-only sweep. Compression withholds the raw descriptor, so this compares
+  # the io_uring raw-slot path against synchronous LZ4 slot reads on real NVMe.
+  # One sweep per page shape. "uniform" reproduces the historical fixed
+  # layout; "chunked" varies run lengths so pages differ from one another.
+  for shape in ${FILE_COMPRESSION_SHAPES}; do
+    python3 scripts/file_compression_demo.py \
+      --tier-path /mnt/nvme/tier/tierbuf-compression.bin \
+      --dataset-mib "${FILE_COMPRESSION_DATASET_MIB}" \
+      --fraction "${FILE_COMPRESSION_FRACTION}" \
+      --compressibility "${FILE_COMPRESSION_PCTS}" \
+      --payload-shape "${shape}" \
+      --payload-spread "${FILE_COMPRESSION_SPREAD}" \
+      --output-dir "/tmp/results/file-compression/${shape}" \
+      | tee "/tmp/results/file-compression-${shape}-summary.txt"
+  done
+fi
+
+if [ -n "${BENCH_S3_BUCKET}" ]; then
+  python3 scripts/s3_cliff_demo.py --yes \
+    --bucket "${BENCH_S3_BUCKET}" \
+    --region "${BENCH_S3_REGION}" \
+    --output-dir /tmp/results/s3-demo \
+    --dashboard /tmp/results/s3-demo/dashboard.html
+fi
 
 TOKEN=$(curl -fsS -X PUT \
   -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
@@ -100,8 +139,15 @@ metadata() {
   echo "kernel=$(uname -r)"
   echo "rustc=$(rustc --version)"
   echo "bench_args=${BENCH_ARGS}"
+  echo "bench_s3_bucket=${BENCH_S3_BUCKET}"
+  echo "bench_s3_region=${BENCH_S3_REGION}"
+  echo "file_compression_demo=${FILE_COMPRESSION_DEMO}"
+  echo "file_compression_pcts=${FILE_COMPRESSION_PCTS}"
+  echo "file_compression_dataset_mib=${FILE_COMPRESSION_DATASET_MIB}"
+  echo "file_compression_fraction=${FILE_COMPRESSION_FRACTION}"
+  echo "file_compression_shapes=${FILE_COMPRESSION_SHAPES}"
+  echo "file_compression_spread=${FILE_COMPRESSION_SPREAD}"
 } > /tmp/results/meta.txt
 
 BENCH_SUCCEEDED=1
 exit 0
-

@@ -14,6 +14,7 @@ fn hot_fix_paths(criterion: &mut Criterion) {
         eviction_mode: EvictionMode::Demand,
         economics: Economics::default(),
         tiers: vec![Box::new(tier) as Box<dyn TierBackend>],
+        ..BufConfig::default()
     })
     .expect("benchmark buffer manager");
     let mut allocated = manager.allocate().expect("benchmark page");

@@ -41,6 +41,10 @@ pub struct TierInfo {
     pub price_gb_month: f64,
     /// Representative page-read latency in microseconds.
     pub read_latency_us: f64,
+    /// Dollars charged for one read request.
+    pub read_request_cost_usd: f64,
+    /// Dollars charged for one write request.
+    pub write_request_cost_usd: f64,
     /// Remaining write budget in bytes, or `None` for an unlimited tier.
     pub write_budget_remaining_bytes: Option<u64>,
 }
@@ -53,6 +57,8 @@ impl TierInfo {
         name: impl Into<String>,
         price_gb_month: f64,
         read_latency_us: f64,
+        read_request_cost_usd: f64,
+        write_request_cost_usd: f64,
         write_budget_remaining_bytes: Option<u64>,
     ) -> Self {
         Self {
@@ -60,6 +66,8 @@ impl TierInfo {
             name: name.into(),
             price_gb_month,
             read_latency_us,
+            read_request_cost_usd,
+            write_request_cost_usd,
             write_budget_remaining_bytes,
         }
     }

@@ -55,6 +55,10 @@ impl Default for Economics {
 }
 
 /// Configuration used to construct a [`BufferManager`].
+///
+/// The default leaves [`Self::tiers`] empty, so it cannot be used directly to
+/// construct a manager. It is intended for struct-update syntax after callers
+/// provide at least one lower storage tier.
 pub struct BufConfig {
     /// Bytes reserved for fixed-size DRAM page frames.
     pub dram_pool_bytes: usize,
@@ -66,6 +70,24 @@ pub struct BufConfig {
     pub economics: Economics,
     /// Lower storage tiers, ordered from fastest to the authoritative tier.
     pub tiers: Vec<Box<dyn TierBackend>>,
+    /// Number of background prefetch worker threads. Defaults to 4.
+    pub prefetch_workers: usize,
+    /// Maximum queued-plus-running prefetch requests. Defaults to 128.
+    pub max_prefetch_in_flight: usize,
+}
+
+impl Default for BufConfig {
+    fn default() -> Self {
+        Self {
+            dram_pool_bytes: 64 * PAGE_SIZE,
+            cooling_ratio: 0.1,
+            eviction_mode: EvictionMode::Demand,
+            economics: Economics::default(),
+            tiers: Vec::new(),
+            prefetch_workers: PREFETCH_WORKERS,
+            max_prefetch_in_flight: MAX_PREFETCH_IN_FLIGHT,
+        }
+    }
 }
 
 /// Background-eviction activation policy.
@@ -476,6 +498,8 @@ pub struct BufferManager {
     workers: Mutex<Vec<JoinHandle<()>>>,
     prefetch_sender: SyncSender<PrefetchTask>,
     prefetch_receiver: Arc<Mutex<Receiver<PrefetchTask>>>,
+    prefetch_workers: usize,
+    max_prefetch_in_flight: usize,
     prefetch_in_flight: Arc<AtomicUsize>,
     prefetch_pending: Arc<Mutex<HashSet<PageId>>>,
     prefetched: Mutex<HashMap<PageId, PrefetchMarker>>,
@@ -491,8 +515,8 @@ impl BufferManager {
     /// # Errors
     ///
     /// Returns [`TierBufError::InvalidConfig`] when page-pool sizing, cooling,
-    /// economic, or tier invariants are invalid. Mapping failures are returned
-    /// as [`TierBufError::Io`].
+    /// economic, or tier invariants are invalid. Mapping and background-worker
+    /// creation failures are returned as [`TierBufError::Io`].
     pub fn new(config: BufConfig) -> Result<Arc<Self>> {
         let defaults = EconomicConfig::default();
         let policy = EconomicPolicy::new(EconomicConfig {
@@ -512,8 +536,8 @@ impl BufferManager {
     /// # Errors
     ///
     /// Returns [`TierBufError::InvalidConfig`] when page-pool sizing, cooling,
-    /// economic, or tier invariants are invalid. Mapping failures are returned
-    /// as [`TierBufError::Io`].
+    /// economic, or tier invariants are invalid. Mapping and background-worker
+    /// creation failures are returned as [`TierBufError::Io`].
     pub fn new_with_policy(
         config: BufConfig,
         policy: Arc<dyn PlacementPolicy>,
@@ -528,7 +552,9 @@ impl BufferManager {
         let stats = StatsRecorder::new(config.tiers.iter().map(|tier| tier.name()));
         let residency_cost = Mutex::new(ResidencyCost::new(config.economics.dram_price_gb_month));
         let epoch = config.economics.epoch;
-        let (prefetch_sender, prefetch_receiver) = sync_channel(MAX_PREFETCH_IN_FLIGHT);
+        let prefetch_workers = config.prefetch_workers;
+        let max_prefetch_in_flight = config.max_prefetch_in_flight;
+        let (prefetch_sender, prefetch_receiver) = sync_channel(max_prefetch_in_flight);
 
         let manager = Arc::new(Self {
             id,
@@ -551,9 +577,11 @@ impl BufferManager {
             epoch,
             worker_signal: Arc::new(WorkerSignal::default()),
             cooler_signal: Arc::new(WorkerSignal::default()),
-            workers: Mutex::new(Vec::with_capacity(2 + PREFETCH_WORKERS)),
+            workers: Mutex::new(Vec::with_capacity(2 + prefetch_workers)),
             prefetch_sender,
             prefetch_receiver: Arc::new(Mutex::new(prefetch_receiver)),
+            prefetch_workers,
+            max_prefetch_in_flight,
             prefetch_in_flight: Arc::new(AtomicUsize::new(0)),
             prefetch_pending: Arc::new(Mutex::new(HashSet::new())),
             prefetched: Mutex::new(HashMap::new()),
@@ -562,7 +590,7 @@ impl BufferManager {
             operation_gate: RwLock::new(()),
             shutdown_lock: Mutex::new(()),
         });
-        Self::start_workers(&manager);
+        Self::start_workers(&manager)?;
         Ok(manager)
     }
 
@@ -852,16 +880,19 @@ impl BufferManager {
     ///
     /// Submission never waits for queue space or I/O. Non-canonical,
     /// resident, policy-ineligible, duplicate, or resource-constrained
-    /// requests are counted as skipped. At most 128 requests from one call may
-    /// be accepted, and no more than 128 requests are queued or running across
-    /// the manager.
+    /// requests are counted as skipped. At most
+    /// [`BufConfig::max_prefetch_in_flight`] requests from one call may be
+    /// accepted, and the same configured limit applies to queued-plus-running
+    /// requests across the manager.
     pub fn prefetch(&self, swips: &[&Swip]) {
         let mut submitted = 0_u64;
         let mut skipped = 0_u64;
-        let mut seen = HashSet::with_capacity(swips.len().min(MAX_PREFETCH_IN_FLIGHT));
+        let mut seen = HashSet::with_capacity(swips.len().min(self.max_prefetch_in_flight));
 
         for &swip in swips {
-            if self.stopping.load(Ordering::Acquire) || submitted >= MAX_PREFETCH_IN_FLIGHT as u64 {
+            if self.stopping.load(Ordering::Acquire)
+                || submitted >= self.max_prefetch_in_flight as u64
+            {
                 skipped = skipped.saturating_add(1);
                 continue;
             }
@@ -887,7 +918,7 @@ impl BufferManager {
                 &self.prefetch_in_flight,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-                |current| (current < MAX_PREFETCH_IN_FLIGHT).then_some(current + 1),
+                |current| (current < self.max_prefetch_in_flight).then_some(current + 1),
             )
             .is_err()
             {
@@ -1018,11 +1049,12 @@ impl BufferManager {
             .tick(elapsed, dram_used_bytes, &tier_samples);
     }
 
-    fn start_workers(manager: &Arc<Self>) {
+    fn start_workers(manager: &Arc<Self>) -> Result<()> {
+        let mut workers = Vec::with_capacity(2 + manager.prefetch_workers);
         let cooler_manager = Arc::downgrade(manager);
         let cooler_stopping = Arc::clone(&manager.stopping);
         let cooler_signal = Arc::clone(&manager.cooler_signal);
-        let cooler = thread::Builder::new()
+        let cooler = match thread::Builder::new()
             .name("tierbuf-cooler".into())
             .spawn(move || {
                 let mut observed_signal = 0;
@@ -1045,45 +1077,49 @@ impl BufferManager {
                         break;
                     }
                 }
-            })
-            .expect("tierbuf cooler thread creation must succeed");
+            }) {
+            Ok(worker) => worker,
+            Err(error) => return Err(Self::worker_start_error(manager, workers, error)),
+        };
+        workers.push(cooler);
 
         let epoch_manager = Arc::downgrade(manager);
         let epoch_stopping = Arc::clone(&manager.stopping);
         let epoch_signal = Arc::clone(&manager.worker_signal);
         let epoch = manager.epoch;
-        let epoch_worker = thread::Builder::new()
-            .name("tierbuf-epoch".into())
-            .spawn(move || {
-                let mut observed_signal = 0;
-                loop {
-                    if wait_for_worker(&epoch_signal, &epoch_stopping, epoch, &mut observed_signal)
-                    {
-                        break;
+        let epoch_worker =
+            match thread::Builder::new()
+                .name("tierbuf-epoch".into())
+                .spawn(move || {
+                    let mut observed_signal = 0;
+                    loop {
+                        if wait_for_worker(
+                            &epoch_signal,
+                            &epoch_stopping,
+                            epoch,
+                            &mut observed_signal,
+                        ) {
+                            break;
+                        }
+                        let Some(manager) = epoch_manager.upgrade() else {
+                            break;
+                        };
+                        if epoch_stopping.load(Ordering::Acquire) {
+                            break;
+                        }
+                        manager.tick_epoch(epoch);
                     }
-                    let Some(manager) = epoch_manager.upgrade() else {
-                        break;
-                    };
-                    if epoch_stopping.load(Ordering::Acquire) {
-                        break;
-                    }
-                    manager.tick_epoch(epoch);
-                }
-            })
-            .expect("tierbuf epoch thread creation must succeed");
+                }) {
+                Ok(worker) => worker,
+                Err(error) => return Err(Self::worker_start_error(manager, workers, error)),
+            };
+        workers.push(epoch_worker);
 
-        manager
-            .workers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend([cooler, epoch_worker]);
-
-        let mut prefetch_workers = Vec::with_capacity(PREFETCH_WORKERS);
-        for worker_index in 0..PREFETCH_WORKERS {
+        for worker_index in 0..manager.prefetch_workers {
             let prefetch_manager = Arc::downgrade(manager);
             let prefetch_stopping = Arc::clone(&manager.stopping);
             let receiver = Arc::clone(&manager.prefetch_receiver);
-            let worker = thread::Builder::new()
+            let worker = match thread::Builder::new()
                 .name(format!("tierbuf-prefetch-{worker_index}"))
                 .spawn(move || {
                     loop {
@@ -1099,15 +1135,32 @@ impl BufferManager {
                         };
                         let _ = manager.prefetch_fault(&mut task);
                     }
-                })
-                .expect("tierbuf prefetch thread creation must succeed");
-            prefetch_workers.push(worker);
+                }) {
+                Ok(worker) => worker,
+                Err(error) => return Err(Self::worker_start_error(manager, workers, error)),
+            };
+            workers.push(worker);
         }
         manager
             .workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .extend(prefetch_workers);
+            .extend(workers);
+        Ok(())
+    }
+
+    fn worker_start_error(
+        manager: &Self,
+        workers: Vec<JoinHandle<()>>,
+        error: io::Error,
+    ) -> TierBufError {
+        manager.stopping.store(true, Ordering::Release);
+        manager.worker_signal.notify();
+        manager.cooler_signal.notify();
+        for worker in workers {
+            let _ = worker.join();
+        }
+        TierBufError::Io(error)
     }
 
     fn join_workers(&self) -> Result<()> {
@@ -1386,11 +1439,17 @@ impl BufferManager {
         let mut new_location = None;
         if needs_write {
             let tier_info = self.live_tier_info();
-            let start = self
+            let Some(start) = self
                 .policy
                 .demotion_target(frame, &tier_info)
                 .filter(|&index| index < self.tiers.len())
-                .unwrap_or(0);
+            else {
+                let _ = owner.try_resurrect(ticket.resident);
+                drop(latch);
+                return Err(TierBufError::TierExhausted {
+                    tier: "no eligible lower tier".to_owned(),
+                });
+            };
             let mut last_error = None;
 
             for tier_index in start..self.tiers.len() {
@@ -1474,11 +1533,14 @@ impl BufferManager {
             .iter()
             .enumerate()
             .map(|(index, tier)| {
+                let request_costs = tier.request_costs();
                 TierInfo::new(
                     index,
                     tier.name(),
                     tier.price_gb_month(),
                     tier.latency().read_us_p50 as f64,
+                    request_costs.read_usd,
+                    request_costs.write_usd,
                     tier.write_budget().map(|budget| budget.available_bytes()),
                 )
             })
@@ -2181,6 +2243,18 @@ fn validate_config(config: &BufConfig) -> Result<()> {
             "economics epoch must be greater than zero".into(),
         ));
     }
+    if !(1..=256).contains(&config.prefetch_workers) {
+        return Err(TierBufError::InvalidConfig(
+            "prefetch_workers must be within 1..=256".into(),
+        ));
+    }
+    if config.max_prefetch_in_flight < config.prefetch_workers
+        || config.max_prefetch_in_flight > 4096
+    {
+        return Err(TierBufError::InvalidConfig(
+            "max_prefetch_in_flight must be within prefetch_workers..=4096".into(),
+        ));
+    }
     if config.tiers.is_empty() {
         return Err(TierBufError::InvalidConfig(
             "at least one lower storage tier is required".into(),
@@ -2217,11 +2291,14 @@ mod tests {
 
     use super::{
         BufConfig, BufferManager, CoolingTicket, Economics, EvictionMode, EvictionOutcome,
-        FixSource, FreeFrame, MAX_PREFETCH_IN_FLIGHT,
+        FixSource, FreeFrame, MAX_PREFETCH_IN_FLIGHT, PREFETCH_WORKERS,
     };
 
     #[derive(Debug)]
     struct WarmFirstPolicy;
+
+    #[derive(Debug)]
+    struct NoTierPolicy;
 
     #[derive(Debug, Default)]
     struct ReadFailureInjection {
@@ -2343,6 +2420,20 @@ mod tests {
         }
     }
 
+    impl PlacementPolicy for NoTierPolicy {
+        fn on_access(&self, _frame: &Frame, _kind: AccessKind) {}
+
+        fn on_epoch(&self) {}
+
+        fn demotion_target(&self, _frame: &Frame, _tiers: &[TierInfo]) -> Option<usize> {
+            None
+        }
+
+        fn admit_to_dram(&self, _pid: crate::swip::PageId, _hint: AccessHint) -> bool {
+            true
+        }
+    }
+
     fn manager(frame_count: usize, read_latency_us: u64) -> Arc<BufferManager> {
         manager_with_mode(frame_count, read_latency_us, EvictionMode::Demand)
     }
@@ -2366,6 +2457,7 @@ mod tests {
             eviction_mode,
             economics: Economics::default(),
             tiers: vec![Box::new(tier) as Box<dyn TierBackend>],
+            ..BufConfig::default()
         })
         .expect("valid buffer manager")
     }
@@ -2387,6 +2479,60 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn valid_prefetch_config() -> BufConfig {
+        let tier = MockTier::new((PAGE_SIZE * 128) as u64).expect("valid mock tier");
+        BufConfig {
+            tiers: vec![Box::new(tier) as Box<dyn TierBackend>],
+            ..BufConfig::default()
+        }
+    }
+
+    #[test]
+    fn default_config_matches_previous_constants() {
+        let config = BufConfig::default();
+        assert_eq!(config.prefetch_workers, PREFETCH_WORKERS);
+        assert_eq!(config.max_prefetch_in_flight, MAX_PREFETCH_IN_FLIGHT);
+    }
+
+    #[test]
+    fn prefetch_config_bounds_are_validated() {
+        let mut zero_workers = valid_prefetch_config();
+        zero_workers.prefetch_workers = 0;
+        assert!(matches!(
+            BufferManager::new(zero_workers),
+            Err(TierBufError::InvalidConfig(message))
+                if message.contains("prefetch_workers must be within 1..=256")
+        ));
+
+        let mut too_few_in_flight = valid_prefetch_config();
+        too_few_in_flight.prefetch_workers = 4;
+        too_few_in_flight.max_prefetch_in_flight = 3;
+        assert!(matches!(
+            BufferManager::new(too_few_in_flight),
+            Err(TierBufError::InvalidConfig(message))
+                if message.contains("prefetch_workers..=4096")
+        ));
+
+        let mut too_many_in_flight = valid_prefetch_config();
+        too_many_in_flight.max_prefetch_in_flight = 4097;
+        assert!(matches!(
+            BufferManager::new(too_many_in_flight),
+            Err(TierBufError::InvalidConfig(message))
+                if message.contains("prefetch_workers..=4096")
+        ));
+    }
+
+    #[test]
+    fn many_workers_spawn_and_join() {
+        let mut config = valid_prefetch_config();
+        config.prefetch_workers = 32;
+        let manager = BufferManager::new(config).expect("32 prefetch workers are valid");
+        Arc::clone(&manager)
+            .shutdown()
+            .expect("32 prefetch workers join cleanly");
+        drop(manager);
     }
 
     #[test]
@@ -2549,6 +2695,7 @@ mod tests {
             eviction_mode: EvictionMode::Demand,
             economics: Economics::default(),
             tiers: vec![Box::new(BlockingFailureTier::new(Arc::clone(&injection)))],
+            ..BufConfig::default()
         })
         .expect("valid manager");
         let mut allocated = manager.allocate().expect("page allocation");
@@ -2840,6 +2987,12 @@ mod tests {
     #[test]
     fn pinned_frame_is_never_selected_for_eviction() {
         let manager = manager(1, 0);
+        // A one-frame pool has exactly one cooling ticket. The background
+        // cooler competes for that ticket, and `acquire_frame` only samples the
+        // queue `windows + 2` times, so a cooler that holds the ticket across
+        // all three attempts makes the reclaiming allocate below fail
+        // spuriously. Demand eviction alone proves the invariant.
+        stop_background_workers(&manager);
         let mut pinned = manager.allocate().expect("pinned allocation");
         let swip = pinned.swip();
         pinned.write_with(|page| page[0] = 0x6d);
@@ -2958,6 +3111,7 @@ mod tests {
                 eviction_mode: EvictionMode::Demand,
                 economics: Economics::default(),
                 tiers: vec![Box::new(warm), Box::new(cold)],
+                ..BufConfig::default()
             },
             Arc::new(WarmFirstPolicy),
         )
@@ -2979,6 +3133,37 @@ mod tests {
         assert_eq!(manager.tiers[1].used_bytes(), PAGE_SIZE as u64);
         let restored = manager.fix_shared(&swip).expect("cold-tier fault");
         restored.read_with(|page| assert_eq!(page[0], 0xc7));
+    }
+
+    #[test]
+    fn missing_demotion_target_does_not_write_tier_zero() {
+        let tier = MockTier::new((PAGE_SIZE * 4) as u64).expect("valid mock tier");
+        let manager = BufferManager::new_with_policy(
+            BufConfig {
+                dram_pool_bytes: PAGE_SIZE,
+                tiers: vec![Box::new(tier)],
+                ..BufConfig::default()
+            },
+            Arc::new(NoTierPolicy),
+        )
+        .expect("valid manager");
+        let allocated = manager.allocate().expect("page allocation");
+        let swip = allocated.swip();
+        drop(allocated);
+
+        let error = manager
+            .manual_evict(&swip)
+            .expect_err("policy rejection must prevent write-back");
+
+        assert!(
+            matches!(
+                error,
+                TierBufError::TierExhausted { ref tier }
+                    if tier == "no eligible lower tier"
+            ),
+            "unexpected eviction error: {error}"
+        );
+        assert_eq!(manager.tiers[0].used_bytes(), 0);
     }
 
     #[test]
@@ -3187,6 +3372,7 @@ mod tests {
             eviction_mode: EvictionMode::Demand,
             economics: Economics::default(),
             tiers: vec![Box::new(tier)],
+            ..BufConfig::default()
         })
         .expect("valid manager");
         let mut allocated = manager.allocate().expect("page allocation");
@@ -3226,6 +3412,7 @@ mod tests {
             eviction_mode: EvictionMode::Demand,
             economics: Economics::default(),
             tiers: vec![Box::new(tier)],
+            ..BufConfig::default()
         })
         .expect("valid manager");
         let mut handles = Vec::with_capacity(REQUESTS);

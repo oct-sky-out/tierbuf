@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "capture_point": "after_measurement_before_shutdown",
+  "runs": [
+    {
+      "fraction": "0.4",
+      "s3": {
+        "get_requests": 1200,
+        "put_requests": 600,
+        "delete_requests": 12,
+        "request_failures": 0,
+        "stored_bytes": 25165824,
+        "logical_bytes": 50331648,
+        "bytes_uploaded": 26214400,
+        "bytes_downloaded": 52428800,
+        "compression_ratio": 0.5
+      }
+    },
+    {
+      "fraction": "1.0",
+      "s3": {
+        "get_requests": 0,
+        "put_requests": 0,
+        "delete_requests": 0,
+        "request_failures": 0,
+        "stored_bytes": 0,
+        "logical_bytes": 0,
+        "bytes_uploaded": 0,
+        "bytes_downloaded": 0,
+        "compression_ratio": null
+      }
+    },
+    {
+      "fraction": "0.1",
+      "s3": {
+        "get_requests": 3600,
+        "put_requests": 900,
+        "delete_requests": 18,
+        "request_failures": 1,
+        "stored_bytes": 37748736,
+        "logical_bytes": 75497472,
+        "bytes_uploaded": 39321600,
+        "bytes_downloaded": 157286400,
+        "compression_ratio": 0.5
+      }
+    },
+    {
+      "fraction": "0.8",
+      "s3": {
+        "get_requests": 400,
+        "put_requests": 200,
+        "delete_requests": 4,
+        "request_failures": 0,
+        "stored_bytes": 8388608,
+        "logical_bytes": 16777216,
+        "bytes_uploaded": 10485760,
+        "bytes_downloaded": 20971520,
+        "compression_ratio": 0.5
+      }
+    },
+    {
+      "fraction": "0.2",
+      "s3": {
+        "get_requests": 2400,
+        "put_requests": 800,
+        "delete_requests": 16,
+        "request_failures": 0,
+        "stored_bytes": 33554432,
+        "logical_bytes": 67108864,
+        "bytes_uploaded": 34603008,
+        "bytes_downloaded": 104857600,
+        "compression_ratio": 0.5
+      }
+    },
+    {
+      "fraction": "0.6",
+      "s3": {
+        "get_requests": 800,
+        "put_requests": 400,
+        "delete_requests": 8,
+        "request_failures": 0,
+        "stored_bytes": 16777216,
+        "logical_bytes": 33554432,
+        "bytes_uploaded": 17825792,
+        "bytes_downloaded": 35651584,
+        "compression_ratio": 0.5
+      }
+    }
+  ]
+}

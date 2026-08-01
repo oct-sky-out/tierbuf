@@ -11,15 +11,26 @@ documentation = "https://docs.rs/tierbuf"
 keywords = ["buffer-pool", "cache", "nvme", "storage"]
 categories = ["caching", "data-structures", "filesystem"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
-default = ["uring"]
+default = ["uring", "lz4"]
+lz4 = ["dep:lz4_flex"]
+s3 = ["dep:hmac", "dep:serde_json", "dep:sha2", "dep:ureq"]
 uring = ["dep:io-uring"]
 
 [dependencies]
+crc32fast.workspace = true
 crossbeam-queue.workspace = true
+hmac = { workspace = true, optional = true }
 libc.workspace = true
+lz4_flex = { workspace = true, optional = true }
 metrics.workspace = true
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 thiserror.workspace = true
+ureq = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true, optional = true }

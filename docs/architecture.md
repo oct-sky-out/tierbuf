@@ -1,8 +1,8 @@
 # tierbuf architecture and invariants
 
-This document describes the implemented v0.1 kernel contracts, including
+This document describes the implemented v0.2 kernel contracts, including
 autonomous cooling, bounded background prefetch, optional Linux `io_uring`,
-cost accounting, and degradation-curve orchestration. Safety-driven changes
+S3 object storage, cost accounting, and degradation-curve orchestration. Safety-driven changes
 from the original plan are explained separately in
 [design-corrections.md](design-corrections.md).
 
@@ -16,7 +16,9 @@ from the original plan are explained separately in
 | `frame` | Frame metadata, pin/eviction control word, stable resident identities, aligned-data association, and free queue |
 | `latch` | Versioned shared, exclusive, and optimistic latch primitives |
 | `sys::mmap` | Anonymous mapping, 64 KiB frame alignment, and isolated raw page-reference construction |
-| `tier` | `TierBackend`, `FileTier`, `MockTier`, offsets, latency profiles, and deterministic write budgets |
+| `tier` | `TierBackend`, fixed-slot `FileTier`, `MockTier`, offsets, latency profiles, request costs, and deterministic write budgets |
+| `tier::envelope` | Fixed-header page envelope, CRC32 validation, and optional LZ4 block compression |
+| `tier::s3` | S3 tier metadata/accounting, immutable object IDs, background deletion, SigV4, credentials, and blocking object API |
 | `policy::heat` | Global epoch plus lazy per-frame 8.24 fixed-point heat decay |
 | `policy::economic` | DRAM page cost, read opportunity cost, break-even calculation, and demotion/admission decisions |
 | `metrics` | Per-tier counters and time-integrated cost reporting |
@@ -164,7 +166,42 @@ Authority depends on dirty state:
   slot only after the new location is visible.
 
 This is cache semantics, not crash consistency. The directory is process-local,
-there is no WAL, and restart recovery is outside v0.1.
+there is no WAL, and restart recovery is outside v0.2.
+
+S3 pages use immutable, monotonically allocated object keys. Rewriting a
+logical page publishes a newly allocated key rather than reusing the previous
+location. One process-wide counter prevents reuse across replacement tiers in
+that process. Because v0.2 does not persist the counter, callers must use a
+unique prefix for each process or dataset generation; under that condition a
+freed key can never name a later page, so a delayed background DELETE cannot
+race with a new PUT and remove current data.
+
+`FileTier` always allocates fixed 64 KiB logical slots. Its default
+`PageCodec::None` representation is the original raw page and remains eligible
+for direct `io_uring` reads. With `PageCodec::Lz4`, a checksummed envelope is
+stored at the front of the slot only when the complete header and payload fit
+strictly within 64 KiB; weakly compressible pages fall back to raw bytes.
+Process-local slot metadata records which representation and stored length to
+read. Direct I/O rounds envelope transfers up to 4 KiB, while buffered I/O
+transfers the exact envelope length. A compression-capable file tier does not
+expose a raw descriptor because `io_uring` would bypass envelope decoding.
+Capacity, `used_bytes`, and write-budget consumption remain conservative
+fixed-page accounting, so compression reduces transfer bytes rather than
+increasing logical capacity.
+
+Because compression trades the `io_uring` path for fewer transferred bytes,
+whether it is worth enabling depends on how compressible the data actually is.
+`scripts/file_compression_demo.py` measures that trade directly: it sweeps
+`tierbuf-bench --payload-compressibility` with `--file-compression off` and
+`on`, then reports the compressibility at which the two throughputs break even.
+Below that point the lost `io_uring` submission path costs more than the saved
+bytes; above it compression wins.
+
+Measured results from one EC2 NVMe run are recorded in
+[FileTier compression: measured crossover](file-compression-benchmark.md).
+Briefly: uniformly compressible pages break even near 66% compressibility, pages
+built from variable-length runs never win, and p99 latency regresses 2-3x in
+every configuration because the raw-descriptor path is withheld.
 
 ## Policy and time
 
@@ -174,11 +211,12 @@ Heat is an unsigned 8.24 fixed-point value packed with its last epoch in one
 with saturation in one CAS loop.
 
 `EconomicPolicy` converts DRAM dollars/GiB-month to a page-second cost and
-lower-tier read latency to an explicit configurable opportunity cost. Their
-ratio is a break-even reaccess interval. Hot pages favor the fastest eligible
-tier; sufficiently cold pages may choose a cheaper tier. A tier with less than
-one page of write budget is skipped, and `AccessHint::Scan` bypasses DRAM
-admission.
+lower-tier read latency plus per-read request charges to an explicit
+opportunity cost. Their ratio is a break-even reaccess interval. Hot pages
+favor the fastest eligible tier; sufficiently cold pages may choose a cheaper
+tier. A tier with less than one page of write budget is skipped, and
+`AccessHint::Scan` bypasses DRAM admission. Per-write charges are carried and
+validated but await a future amortization model.
 
 `BufferManager` advances the policy clock and write budgets on its epoch
 worker, integrates residency cost, and uses the policy for scan admission and
@@ -187,15 +225,18 @@ write-back target selection.
 ## Prefetch and Linux I/O
 
 `prefetch` accepts only canonical evicted handles, never waits for queue space,
-reserves free frames at submission, and caps queued plus running work at 128
-requests. Four background workers own accepted requests until the fault either
-publishes a resident frame or returns every reservation on error. Before the
+and reserves free frames at submission. `BufConfig` controls the queued plus
+running cap (default 128) and worker count (default four); S3 deployments
+normally raise both to overlap many blocking GETs. Workers own accepted
+requests until the fault either publishes a resident frame or returns every
+reservation on error. Before the
 resident Swip becomes visible, a completed prefetch publishes a one-shot
 `(resident address, frame generation)` marker. The next exact demand fix
 consumes it; eviction removes it, so frame reuse cannot create a false hit.
 
-On Linux with the default `uring` feature, file-backed reads use
-`UringReader` when ring construction and a raw file descriptor are available.
+On Linux with the default `uring` feature, raw, uncompressed file-backed reads
+use `UringReader` when ring construction and a raw file descriptor are
+available.
 One dedicated thread owns the ring, batches queued requests into the SQ, and
 routes CQEs by unique request ID. Each request owns a 64 KiB-aligned buffer
 until its CQE is observed; the waiting demand or prefetch worker then copies it

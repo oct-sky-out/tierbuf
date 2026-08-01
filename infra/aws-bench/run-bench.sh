@@ -22,9 +22,63 @@ if [[ "${BUCKET}" == *replace-with* ]] || [[ "${REPO_URL}" == *YOUR_GITHUB_ID* ]
   echo "bench.env still contains placeholder values" >&2
   exit 2
 fi
+if [ -n "${BENCH_S3_BUCKET:-}" ]; then
+  require_value BENCH_S3_REGION
+  if [ "${BENCH_S3_BUCKET}" = "${BUCKET}" ]; then
+    echo "bench.env: BENCH_S3_BUCKET must differ from the result BUCKET" >&2
+    exit 2
+  fi
+  if [[ "${BENCH_S3_BUCKET}" == *replace-with* ]]; then
+    echo "bench.env: BENCH_S3_BUCKET still contains a placeholder value" >&2
+    exit 2
+  fi
+fi
 if ! [[ "${MAX_MINUTES}" =~ ^[1-9][0-9]*$ ]]; then
   echo "bench.env: MAX_MINUTES must be a positive integer" >&2
   exit 2
+fi
+if [ -n "${BENCH_FILE_COMPRESSION_DEMO:-}" ]; then
+  for name in BENCH_FILE_COMPRESSION_PCTS BENCH_FILE_COMPRESSION_DATASET_MIB \
+    BENCH_FILE_COMPRESSION_FRACTION BENCH_FILE_COMPRESSION_SHAPES \
+    BENCH_FILE_COMPRESSION_SPREAD; do
+    require_value "${name}"
+  done
+  for shape in ${BENCH_FILE_COMPRESSION_SHAPES}; do
+    case "${shape}" in
+      uniform | chunked) ;;
+      *)
+        echo "bench.env: BENCH_FILE_COMPRESSION_SHAPES accepts only 'uniform' and 'chunked'; got '${shape}'" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if ! [[ "${BENCH_FILE_COMPRESSION_SPREAD}" =~ ^[0-9]+$ ]] \
+    || [ "${BENCH_FILE_COMPRESSION_SPREAD}" -gt 100 ]; then
+    echo "bench.env: BENCH_FILE_COMPRESSION_SPREAD must be within 0..=100" >&2
+    exit 2
+  fi
+  if ! [[ "${BENCH_FILE_COMPRESSION_PCTS}" =~ ^[0-9]+(,[0-9]+)+$ ]]; then
+    echo "bench.env: BENCH_FILE_COMPRESSION_PCTS must be a comma-separated list of at least two percentages" >&2
+    exit 2
+  fi
+  if ! [[ "${BENCH_FILE_COMPRESSION_DATASET_MIB}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "bench.env: BENCH_FILE_COMPRESSION_DATASET_MIB must be a positive integer" >&2
+    exit 2
+  fi
+fi
+if [ -n "${BENCH_S3_BUCKET:-}" ]; then
+  INSTANCE_MEMORY_MIB=$(aws ec2 describe-instance-types --region "${REGION}" \
+    --instance-types "${INSTANCE_TYPE}" \
+    --query 'InstanceTypes[0].MemoryInfo.SizeInMiB' --output text)
+  if ! [[ "${INSTANCE_MEMORY_MIB}" =~ ^[0-9]+$ ]] \
+    || [ "${INSTANCE_MEMORY_MIB}" -lt 65536 ]; then
+    echo "S3 demo requires an instance with at least 65536 MiB RAM; ${INSTANCE_TYPE} reports ${INSTANCE_MEMORY_MIB}" >&2
+    exit 2
+  fi
+  if [ "${MAX_MINUTES}" -lt 180 ]; then
+    echo "S3 demo requires MAX_MINUTES >= 180 for its bounded parallel load" >&2
+    exit 2
+  fi
 fi
 
 RUN_ID="$(date -u +%Y%m%d-%H%M%S)-${INSTANCE_TYPE//./-}"
@@ -55,9 +109,17 @@ trap cleanup EXIT
 
 sed -e "s|__RUN_ID_B64__|$(encode "${RUN_ID}")|g" \
   -e "s|__BUCKET_B64__|$(encode "${BUCKET}")|g" \
+  -e "s|__BENCH_S3_BUCKET_B64__|$(encode "${BENCH_S3_BUCKET:-}")|g" \
+  -e "s|__BENCH_S3_REGION_B64__|$(encode "${BENCH_S3_REGION:-}")|g" \
   -e "s|__REPO_URL_B64__|$(encode "${REPO_URL}")|g" \
   -e "s|__REPO_BRANCH_B64__|$(encode "${REPO_BRANCH}")|g" \
   -e "s|__BENCH_ARGS_B64__|$(encode "${BENCH_ARGS}")|g" \
+  -e "s|__FILE_COMPRESSION_DEMO_B64__|$(encode "${BENCH_FILE_COMPRESSION_DEMO:-}")|g" \
+  -e "s|__FILE_COMPRESSION_PCTS_B64__|$(encode "${BENCH_FILE_COMPRESSION_PCTS:-}")|g" \
+  -e "s|__FILE_COMPRESSION_DATASET_MIB_B64__|$(encode "${BENCH_FILE_COMPRESSION_DATASET_MIB:-}")|g" \
+  -e "s|__FILE_COMPRESSION_FRACTION_B64__|$(encode "${BENCH_FILE_COMPRESSION_FRACTION:-}")|g" \
+  -e "s|__FILE_COMPRESSION_SHAPES_B64__|$(encode "${BENCH_FILE_COMPRESSION_SHAPES:-}")|g" \
+  -e "s|__FILE_COMPRESSION_SPREAD_B64__|$(encode "${BENCH_FILE_COMPRESSION_SPREAD:-}")|g" \
   -e "s|__MAX_MINUTES__|${MAX_MINUTES}|g" \
   "${SCRIPT_DIR}/user-data.sh.tpl" > "${UD_FILE}"
 
@@ -65,6 +127,10 @@ KEY_OPT=()
 if [ -n "${KEY_NAME:-}" ]; then
   KEY_OPT=(--key-name "${KEY_NAME}")
 fi
+# Bash 3.2, which macOS still ships, treats "${KEY_OPT[@]}" as unbound under
+# `set -u` when the array is empty. The +alternate form expands to nothing
+# instead of aborting the launch.
+KEY_ARGS=("${KEY_OPT[@]+"${KEY_OPT[@]}"}")
 
 INSTANCE_ID=$(aws ec2 run-instances --region "${REGION}" \
   --image-id "${AMI}" --instance-type "${INSTANCE_TYPE}" \
@@ -75,7 +141,7 @@ INSTANCE_ID=$(aws ec2 run-instances --region "${REGION}" \
   --instance-initiated-shutdown-behavior terminate \
   --user-data "file://${UD_FILE}" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=tierbuf-bench-${RUN_ID}},{Key=project,Value=tierbuf}]" \
-  "${KEY_OPT[@]}" \
+  "${KEY_ARGS[@]+"${KEY_ARGS[@]}"}" \
   --query 'Instances[0].InstanceId' --output text)
 
 echo "Launched ${INSTANCE_ID} (Spot, terminate on shutdown)."
@@ -97,4 +163,3 @@ done
 
 echo "Polling timed out. Inspect ${S3_PREFIX}/bench.log" >&2
 exit 1
-
