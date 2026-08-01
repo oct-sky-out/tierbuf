@@ -127,6 +127,10 @@ KEY_OPT=()
 if [ -n "${KEY_NAME:-}" ]; then
   KEY_OPT=(--key-name "${KEY_NAME}")
 fi
+# Bash 3.2, which macOS still ships, treats "${KEY_OPT[@]}" as unbound under
+# `set -u` when the array is empty. The +alternate form expands to nothing
+# instead of aborting the launch.
+KEY_ARGS=("${KEY_OPT[@]+"${KEY_OPT[@]}"}")
 
 INSTANCE_ID=$(aws ec2 run-instances --region "${REGION}" \
   --image-id "${AMI}" --instance-type "${INSTANCE_TYPE}" \
@@ -137,7 +141,7 @@ INSTANCE_ID=$(aws ec2 run-instances --region "${REGION}" \
   --instance-initiated-shutdown-behavior terminate \
   --user-data "file://${UD_FILE}" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=tierbuf-bench-${RUN_ID}},{Key=project,Value=tierbuf}]" \
-  "${KEY_OPT[@]}" \
+  "${KEY_ARGS[@]+"${KEY_ARGS[@]}"}" \
   --query 'Instances[0].InstanceId' --output text)
 
 echo "Launched ${INSTANCE_ID} (Spot, terminate on shutdown)."
