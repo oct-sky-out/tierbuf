@@ -2668,6 +2668,10 @@ mod tests {
                 logical_bytes: 64,
                 ..S3TierStats::default()
             }),
+            PayloadDescriptor {
+                compressibility_pct: 100,
+                file_compression: false,
+            },
         )
         .expect("valid stats delta");
 
