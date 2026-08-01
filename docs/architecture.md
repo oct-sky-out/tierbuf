@@ -197,6 +197,12 @@ whether it is worth enabling depends on how compressible the data actually is.
 Below that point the lost `io_uring` submission path costs more than the saved
 bytes; above it compression wins.
 
+Measured results from one EC2 NVMe run are recorded in
+[FileTier compression: measured crossover](file-compression-benchmark.md).
+Briefly: uniformly compressible pages break even near 66% compressibility, pages
+built from variable-length runs never win, and p99 latency regresses 2-3x in
+every configuration because the raw-descriptor path is withheld.
+
 ## Policy and time
 
 Heat is an unsigned 8.24 fixed-point value packed with its last epoch in one
