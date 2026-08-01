@@ -19,7 +19,7 @@ use tierbuf::metrics::{TierCounters, TierStats};
 use tierbuf::policy::AccessHint;
 use tierbuf::pool::{BufConfig, BufferManager, Economics, EvictionMode, FixSource};
 use tierbuf::swip::Swip;
-use tierbuf::tier::envelope::PageCodec;
+use tierbuf::tier::envelope::{PageCodec, encode_page};
 use tierbuf::tier::file::{FileTier, FileTierConfig};
 use tierbuf::tier::mock::MockTier;
 use tierbuf::tier::s3::client::{ObjectApi, S3Client, S3ClientConfig};
@@ -39,6 +39,12 @@ const DEFAULT_PREFETCH_IN_FLIGHT: usize = 128;
 const DEFAULT_S3_PREFETCH_WORKERS: usize = 64;
 const DEFAULT_S3_PREFETCH_IN_FLIGHT: usize = 256;
 const DEFAULT_S3_REGION: &str = "us-east-1";
+/// Percentage of each page filled with zeros before the pseudorandom tail.
+///
+/// The default keeps the historical all-zero payload, so runs recorded before
+/// this option existed remain directly comparable.
+const DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT: u8 = 100;
+const PAYLOAD_SEED_SALT: u64 = 0x510e_527f_ade6_82d1;
 const DEFAULT_OUTPUT: &str = "results/curve.csv";
 const DEFAULT_STATS_OUTPUT: &str = "results/stats.json";
 const ECONOMIC_EPOCH: Duration = Duration::from_millis(100);
@@ -135,9 +141,18 @@ fn run_fraction(
         let initialized = if config.s3.is_some() {
             // Keep loading concurrency fixed so --compare-prefetch changes
             // only the measured prefetch path, not the initial resident set.
-            initialize_dataset_parallel(&manager, layout.page_count, DEFAULT_S3_PREFETCH_WORKERS)?
+            initialize_dataset_parallel(
+                &manager,
+                layout.page_count,
+                DEFAULT_S3_PREFETCH_WORKERS,
+                config.payload_compressibility_pct,
+            )?
         } else {
-            initialize_dataset(&manager, layout.page_count)?
+            initialize_dataset(
+                &manager,
+                layout.page_count,
+                config.payload_compressibility_pct,
+            )?
         };
         let swips: Arc<[Swip]> = initialized.into();
         let zipf = Arc::new(ZipfSampler::new(layout.page_count)?);
@@ -188,6 +203,7 @@ fn run_fraction(
             &stats_before,
             &stats_after,
             s3_stats.as_ref().map(S3TierStatsHandle::snapshot),
+            PayloadDescriptor::from_config(config),
         )?;
         let row = BenchRow::from_measurement(
             fraction,
@@ -263,10 +279,12 @@ fn fraction_stats_json(
     stats_before: &TierStats,
     stats_after: &TierStats,
     s3_stats: Option<S3TierStats>,
+    payload: PayloadDescriptor,
 ) -> Result<Value, String> {
     let measurement_stats = tier_stats_delta(stats_before, stats_after)?;
     let mut run = json!({
         "fraction": fraction.label(),
+        "payload": payload_json(payload),
         "measurement_seconds": measured.elapsed.as_secs_f64(),
         "measurement_operations": {
             "total": measured.operations,
@@ -284,6 +302,30 @@ fn fraction_stats_json(
         run.insert("s3".to_owned(), s3_stats_json(s3_stats));
     }
     Ok(run)
+}
+
+/// Payload and file-tier codec settings recorded alongside one measurement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PayloadDescriptor {
+    compressibility_pct: u8,
+    file_compression: bool,
+}
+
+impl PayloadDescriptor {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            compressibility_pct: config.payload_compressibility_pct,
+            file_compression: config.file_compression,
+        }
+    }
+}
+
+fn payload_json(payload: PayloadDescriptor) -> Value {
+    json!({
+        "compressibility_pct": payload.compressibility_pct,
+        "file_compression": payload.file_compression,
+        "sampled_compression_ratio": sampled_compression_ratio(payload.compressibility_pct),
+    })
 }
 
 fn s3_stats_json(stats: S3TierStats) -> Value {
@@ -521,6 +563,13 @@ fn make_manager(
                 file_config.name = "file".to_owned();
                 file_config.price_gb_month = MOCK_PRICE_GIB_MONTH;
                 file_config.latency = latency;
+                // Compression makes FileTier withhold its raw descriptor, so
+                // this also selects the synchronous read path over io_uring.
+                file_config.codec = if config.file_compression {
+                    PageCodec::Lz4
+                } else {
+                    PageCodec::None
+                };
                 tiers
                     .push(Box::new(FileTier::open(path, file_config).map_err(
                         |error| format!("failed to create FileTier: {error}"),
@@ -591,6 +640,7 @@ fn make_manager(
 fn initialize_dataset(
     manager: &Arc<BufferManager>,
     page_count: usize,
+    compressibility_pct: u8,
 ) -> Result<Vec<Swip>, String> {
     let mut swips = Vec::with_capacity(page_count);
 
@@ -599,6 +649,7 @@ fn initialize_dataset(
             manager,
             index,
             page_count,
+            compressibility_pct,
             RESOURCE_RETRY_TIMEOUT,
         )?);
     }
@@ -610,9 +661,16 @@ fn initialize_dataset_parallel(
     manager: &Arc<BufferManager>,
     page_count: usize,
     worker_count: usize,
+    compressibility_pct: u8,
 ) -> Result<Vec<Swip>, String> {
     parallel_collect_ordered(page_count, worker_count, |index| {
-        initialize_page(manager, index, page_count, S3_RESOURCE_RETRY_TIMEOUT)
+        initialize_page(
+            manager,
+            index,
+            page_count,
+            compressibility_pct,
+            S3_RESOURCE_RETRY_TIMEOUT,
+        )
     })
 }
 
@@ -620,13 +678,14 @@ fn initialize_page(
     manager: &Arc<BufferManager>,
     index: usize,
     page_count: usize,
+    compressibility_pct: u8,
     retry_timeout: Duration,
 ) -> Result<Swip, String> {
     let retry_deadline = Instant::now() + retry_timeout;
     loop {
         match manager.allocate() {
             Ok(mut guard) => {
-                guard.write_with(|page| page[0] = page_marker(index));
+                guard.write_with(|page| fill_page(page, index, compressibility_pct));
                 return Ok(guard.swip());
             }
             Err(TierBufError::PoolExhausted) if Instant::now() < retry_deadline => {
@@ -1017,6 +1076,54 @@ fn duration_as_nanos_u64(duration: Duration) -> u64 {
 fn page_marker(index: usize) -> u8 {
     let mixed = index.wrapping_mul(131).wrapping_add(17);
     u8::try_from(mixed % 251 + 1).expect("page marker is in the range 1..=251")
+}
+
+/// Returns the leading zero-filled byte count for one payload compressibility.
+///
+/// The first byte always carries the verification marker, so the result is at
+/// least one byte and at most a whole page.
+fn compressible_prefix_len(compressibility_pct: u8) -> usize {
+    let percent = usize::from(compressibility_pct.min(100));
+    1 + (PAGE_SIZE - 1) * percent / 100
+}
+
+/// Writes the verification marker and a payload with the requested compressibility.
+///
+/// Bytes inside the compressible prefix stay zero, which LZ4 collapses almost
+/// entirely, while the remaining tail holds deterministic pseudorandom bytes
+/// that LZ4 cannot shrink. Sweeping the percentage therefore sweeps the
+/// achievable compression ratio without disturbing the access pattern, page
+/// count, or verification cost.
+fn fill_page(page: &mut [u8; PAGE_SIZE], index: usize, compressibility_pct: u8) {
+    let prefix = compressible_prefix_len(compressibility_pct);
+    page[..prefix].fill(0);
+
+    let mut state = (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ PAYLOAD_SEED_SALT;
+    if state == 0 {
+        // A zero xorshift state would stay zero and silently make one page
+        // fully compressible regardless of the requested percentage.
+        state = PAYLOAD_SEED_SALT;
+    }
+    for chunk in page[prefix..].chunks_mut(size_of::<u64>()) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+    }
+
+    page[0] = page_marker(index);
+}
+
+/// Returns the LZ4 envelope ratio achieved by one representative payload.
+///
+/// Every page shares the same compressible-prefix structure, so encoding a
+/// single sample reports the ratio the file tier will achieve without adding
+/// per-page accounting to the library.
+fn sampled_compression_ratio(compressibility_pct: u8) -> Option<f64> {
+    let mut page = Box::new([0_u8; PAGE_SIZE]);
+    fill_page(&mut page, 0, compressibility_pct);
+    let envelope = encode_page(page.as_slice(), PageCodec::Lz4).ok()?;
+    Some(envelope.len() as f64 / PAGE_SIZE as f64)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1534,6 +1641,8 @@ struct Config {
     prefetch_in_flight: usize,
     scan_only: bool,
     file_tier: Option<PathBuf>,
+    file_compression: bool,
+    payload_compressibility_pct: u8,
     s3: Option<S3BenchConfig>,
     output: PathBuf,
     stats_output: PathBuf,
@@ -1554,6 +1663,8 @@ impl Default for Config {
             prefetch_in_flight: DEFAULT_PREFETCH_IN_FLIGHT,
             scan_only: false,
             file_tier: None,
+            file_compression: false,
+            payload_compressibility_pct: DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
             s3: None,
             output: PathBuf::from(DEFAULT_OUTPUT),
             stats_output: PathBuf::from(DEFAULT_STATS_OUTPUT),
@@ -1692,6 +1803,8 @@ where
     let mut prefetch_scan = false;
     let mut scan_only = false;
     let mut file_tier = None;
+    let mut file_compression = None;
+    let mut payload_compressibility = None;
     let mut s3_bucket = None;
     let mut s3_region = None;
     let mut s3_endpoint = None;
@@ -1760,6 +1873,12 @@ where
             "--file-tier" => {
                 file_tier = Some(PathBuf::from(next_value()?));
             }
+            "--file-compression" => {
+                file_compression = Some(parse_toggle(&next_value()?, flag)?);
+            }
+            "--payload-compressibility" => {
+                payload_compressibility = Some(parse_percentage(&next_value()?, flag)?);
+            }
             "--s3-bucket" => {
                 s3_bucket = Some(next_value()?);
             }
@@ -1773,7 +1892,7 @@ where
                 s3_prefix = Some(next_value()?);
             }
             "--s3-compression" => {
-                s3_compression = Some(parse_s3_compression(&next_value()?, flag)?);
+                s3_compression = Some(parse_toggle(&next_value()?, flag)?);
             }
             "--s3-capacity-mib" => {
                 s3_capacity_mib = Some(parse_u64(&next_value()?, flag)?);
@@ -1801,6 +1920,9 @@ where
         }
     }
 
+    if file_tier.is_none() && file_compression.is_some() {
+        return Err("--file-compression requires --file-tier".to_owned());
+    }
     if s3_bucket.is_none() {
         for (flag, supplied) in [
             ("--s3-region", s3_region.is_some()),
@@ -1850,6 +1972,10 @@ where
     config.scan_only = scan_only;
     if let Some(value) = file_tier {
         config.file_tier = Some(value);
+    }
+    config.file_compression = file_compression.unwrap_or(false);
+    if let Some(value) = payload_compressibility {
+        config.payload_compressibility_pct = value;
     }
     if let Some(bucket) = s3_bucket {
         let capacity_mib = match s3_capacity_mib {
@@ -1904,12 +2030,22 @@ fn parse_fraction(value: &str, flag: &str) -> Result<DramFraction, String> {
     })
 }
 
-fn parse_s3_compression(value: &str, flag: &str) -> Result<bool, String> {
+fn parse_toggle(value: &str, flag: &str) -> Result<bool, String> {
     match value {
         "on" => Ok(true),
         "off" => Ok(false),
         _ => Err(format!("{flag} expects 'on' or 'off'; got '{value}'")),
     }
+}
+
+fn parse_percentage(value: &str, flag: &str) -> Result<u8, String> {
+    let percent: u16 = value
+        .parse()
+        .map_err(|_| format!("{flag} expects a whole percentage, got '{value}'"))?;
+    if percent > 100 {
+        return Err(format!("{flag} must be within 0..=100; got '{value}'"));
+    }
+    u8::try_from(percent).map_err(|_| format!("{flag} must be within 0..=100; got '{value}'"))
 }
 
 fn default_s3_prefix() -> String {
@@ -1985,6 +2121,11 @@ Options:
     --prefetch-in-flight N  Queued-plus-running prefetch limit (default: S3 256, otherwise 128)
     --scan-only             Run the sequential scan component only
     --file-tier PATH        Use a reusable FileTier; precedes S3 when both are set
+    --file-compression MODE FileTier LZ4 slot compression: on or off (default);
+                            'on' also disables the io_uring read path
+    --payload-compressibility PCT
+                            Percent of each page that is zero-filled and thus
+                            compressible; 0 is incompressible (default: 100)
     --s3-bucket NAME        Enable an S3 tier for this bucket
     --s3-region REGION      S3 signing region (default: us-east-1)
     --s3-endpoint URL       Custom path-style endpoint for MinIO or LocalStack
@@ -2021,10 +2162,12 @@ mod tests {
     use tierbuf::tier::{LatencyProfile, TierBackend, TierOffset, WriteBudget};
 
     use super::{
-        BenchRow, CSV_HEADER, CliAction, Config, CsvOutput, DramFraction, EvictionMode,
-        POINT_ACCESS_PERCENT, PhaseResult, TierKind, WorkloadState, ZipfSampler, format_csv_row,
+        BenchRow, CSV_HEADER, CliAction, Config, CsvOutput, DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT,
+        DramFraction, EvictionMode, POINT_ACCESS_PERCENT, PayloadDescriptor, PhaseResult, TierKind,
+        WorkloadState, ZipfSampler, compressible_prefix_len, fill_page, format_csv_row,
         fraction_stats_json, initialize_dataset_parallel, page_marker, parallel_collect_ordered,
-        parse_cli, percentile, s3_client_config, s3_stats_json, smoke_object_api, tier_plan,
+        parse_cli, percentile, s3_client_config, s3_stats_json, sampled_compression_ratio,
+        smoke_object_api, tier_plan,
     };
 
     #[derive(Clone, Default)]
@@ -2245,6 +2388,100 @@ mod tests {
     }
 
     #[test]
+    fn file_compression_flags_round_trip_and_require_a_file_tier() {
+        let config = run_config(&[
+            "--file-tier",
+            "/tmp/tierbuf-file",
+            "--file-compression",
+            "on",
+            "--payload-compressibility",
+            "40",
+        ]);
+        assert!(config.file_compression);
+        assert_eq!(config.payload_compressibility_pct, 40);
+
+        let defaults = run_config(&["--file-tier", "/tmp/tierbuf-file"]);
+        assert!(!defaults.file_compression);
+        assert_eq!(
+            defaults.payload_compressibility_pct,
+            DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT
+        );
+
+        // The payload shape is tier-independent, so it is valid on its own.
+        assert_eq!(
+            run_config(&["--payload-compressibility", "0"]).payload_compressibility_pct,
+            0
+        );
+
+        for invalid in [
+            vec!["--file-compression", "on"],
+            vec![
+                "--file-tier",
+                "/tmp/tierbuf-file",
+                "--file-compression",
+                "yes",
+            ],
+            vec!["--payload-compressibility", "101"],
+            vec!["--payload-compressibility", "-1"],
+            vec!["--payload-compressibility", "half"],
+        ] {
+            assert!(
+                parse_cli(invalid.iter().copied()).is_err(),
+                "arguments should be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_compressibility_spans_incompressible_to_all_zero() {
+        let mut page = Box::new([0_u8; PAGE_SIZE]);
+
+        fill_page(&mut page, 7, 100);
+        assert_eq!(page[0], page_marker(7));
+        assert!(
+            page[1..].iter().all(|byte| *byte == 0),
+            "a fully compressible page keeps the historical all-zero payload"
+        );
+
+        fill_page(&mut page, 7, 0);
+        assert_eq!(page[0], page_marker(7));
+        let nonzero = page[1..].iter().filter(|byte| **byte != 0).count();
+        assert!(
+            nonzero > (PAGE_SIZE - 1) / 2,
+            "an incompressible page should be mostly nonzero, saw {nonzero}"
+        );
+
+        // The prefix boundary is exact, so a mid sweep splits the page.
+        fill_page(&mut page, 7, 50);
+        let prefix = compressible_prefix_len(50);
+        assert!(page[1..prefix].iter().all(|byte| *byte == 0));
+        assert!(page[prefix..].iter().any(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn sampled_compression_ratio_decreases_with_compressibility() {
+        let incompressible =
+            sampled_compression_ratio(0).expect("LZ4 sampling requires the lz4 feature");
+        let mixed = sampled_compression_ratio(50).expect("LZ4 sampling requires the lz4 feature");
+        let compressible =
+            sampled_compression_ratio(100).expect("LZ4 sampling requires the lz4 feature");
+
+        assert!(
+            compressible < mixed && mixed < incompressible,
+            "ratios should fall as compressibility rises: \
+             {compressible} < {mixed} < {incompressible}"
+        );
+        assert!(
+            incompressible >= 1.0,
+            "random payloads must fall back to verbatim storage, got {incompressible}"
+        );
+        assert!(
+            compressible < 0.05,
+            "all-zero payloads should compress hard, got {compressible}"
+        );
+    }
+
+    #[test]
     fn tier_plan_preserves_file_then_s3_order() {
         assert_eq!(tier_plan(&run_config(&[])), vec![TierKind::Mock]);
         assert_eq!(
@@ -2348,7 +2585,9 @@ mod tests {
         })
         .expect("buffer manager");
 
-        let swips = initialize_dataset_parallel(&manager, 64, 8).expect("parallel initialization");
+        let swips =
+            initialize_dataset_parallel(&manager, 64, 8, DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT)
+                .expect("parallel initialization");
         assert_eq!(swips.len(), 64);
         for (index, swip) in swips.iter().enumerate() {
             let guard = manager.fix_shared(swip).expect("initialized page");
@@ -2374,7 +2613,9 @@ mod tests {
         })
         .expect("buffer manager");
 
-        let swips = initialize_dataset_parallel(&manager, 64, 8).expect("parallel initialization");
+        let swips =
+            initialize_dataset_parallel(&manager, 64, 8, DEFAULT_PAYLOAD_COMPRESSIBILITY_PCT)
+                .expect("parallel initialization");
         assert_eq!(swips.len(), 64);
         let peak = probe.peak.load(Ordering::Acquire);
         assert!(peak > 1, "expected concurrent tier writes, observed {peak}");
