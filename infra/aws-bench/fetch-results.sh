@@ -43,9 +43,10 @@ for run_dir in "${RESULTS_DIR}"/*; do
   compression_run_dir="${FILE_COMPRESSION_RESULTS_DIR}/${run_id}"
   mkdir -p "${compression_run_dir}"
   cp -R "${run_dir}/file-compression/." "${compression_run_dir}/"
-  if [ -f "${run_dir}/file-compression-summary.txt" ]; then
-    cp "${run_dir}/file-compression-summary.txt" "${compression_run_dir}/summary.txt"
-  fi
+  for summary in "${run_dir}"/file-compression-*-summary.txt; do
+    [ -f "${summary}" ] || continue
+    cp "${summary}" "${compression_run_dir}/$(basename "${summary}")"
+  done
   COMPRESSION_COUNT=$((COMPRESSION_COUNT + 1))
 done
 if [ "${COMPRESSION_COUNT}" -gt 0 ]; then

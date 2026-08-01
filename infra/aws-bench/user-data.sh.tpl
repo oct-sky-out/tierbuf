@@ -18,6 +18,8 @@ FILE_COMPRESSION_DEMO=$(decode "__FILE_COMPRESSION_DEMO_B64__")
 FILE_COMPRESSION_PCTS=$(decode "__FILE_COMPRESSION_PCTS_B64__")
 FILE_COMPRESSION_DATASET_MIB=$(decode "__FILE_COMPRESSION_DATASET_MIB_B64__")
 FILE_COMPRESSION_FRACTION=$(decode "__FILE_COMPRESSION_FRACTION_B64__")
+FILE_COMPRESSION_SHAPES=$(decode "__FILE_COMPRESSION_SHAPES_B64__")
+FILE_COMPRESSION_SPREAD=$(decode "__FILE_COMPRESSION_SPREAD_B64__")
 MAX_MINUTES="__MAX_MINUTES__"
 BENCH_SUCCEEDED=0
 
@@ -94,13 +96,19 @@ mkdir -p /tmp/results /mnt/nvme/tier
 if [ -n "${FILE_COMPRESSION_DEMO}" ]; then
   # NVMe-only sweep. Compression withholds the raw descriptor, so this compares
   # the io_uring raw-slot path against synchronous LZ4 slot reads on real NVMe.
-  python3 scripts/file_compression_demo.py \
-    --tier-path /mnt/nvme/tier/tierbuf-compression.bin \
-    --dataset-mib "${FILE_COMPRESSION_DATASET_MIB}" \
-    --fraction "${FILE_COMPRESSION_FRACTION}" \
-    --compressibility "${FILE_COMPRESSION_PCTS}" \
-    --output-dir /tmp/results/file-compression \
-    | tee /tmp/results/file-compression-summary.txt
+  # One sweep per page shape. "uniform" reproduces the historical fixed
+  # layout; "chunked" varies run lengths so pages differ from one another.
+  for shape in ${FILE_COMPRESSION_SHAPES}; do
+    python3 scripts/file_compression_demo.py \
+      --tier-path /mnt/nvme/tier/tierbuf-compression.bin \
+      --dataset-mib "${FILE_COMPRESSION_DATASET_MIB}" \
+      --fraction "${FILE_COMPRESSION_FRACTION}" \
+      --compressibility "${FILE_COMPRESSION_PCTS}" \
+      --payload-shape "${shape}" \
+      --payload-spread "${FILE_COMPRESSION_SPREAD}" \
+      --output-dir "/tmp/results/file-compression/${shape}" \
+      | tee "/tmp/results/file-compression-${shape}-summary.txt"
+  done
 fi
 
 if [ -n "${BENCH_S3_BUCKET}" ]; then
@@ -132,6 +140,8 @@ metadata() {
   echo "file_compression_pcts=${FILE_COMPRESSION_PCTS}"
   echo "file_compression_dataset_mib=${FILE_COMPRESSION_DATASET_MIB}"
   echo "file_compression_fraction=${FILE_COMPRESSION_FRACTION}"
+  echo "file_compression_shapes=${FILE_COMPRESSION_SHAPES}"
+  echo "file_compression_spread=${FILE_COMPRESSION_SPREAD}"
 } > /tmp/results/meta.txt
 
 BENCH_SUCCEEDED=1

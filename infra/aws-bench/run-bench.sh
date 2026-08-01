@@ -39,9 +39,24 @@ if ! [[ "${MAX_MINUTES}" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [ -n "${BENCH_FILE_COMPRESSION_DEMO:-}" ]; then
   for name in BENCH_FILE_COMPRESSION_PCTS BENCH_FILE_COMPRESSION_DATASET_MIB \
-    BENCH_FILE_COMPRESSION_FRACTION; do
+    BENCH_FILE_COMPRESSION_FRACTION BENCH_FILE_COMPRESSION_SHAPES \
+    BENCH_FILE_COMPRESSION_SPREAD; do
     require_value "${name}"
   done
+  for shape in ${BENCH_FILE_COMPRESSION_SHAPES}; do
+    case "${shape}" in
+      uniform | chunked) ;;
+      *)
+        echo "bench.env: BENCH_FILE_COMPRESSION_SHAPES accepts only 'uniform' and 'chunked'; got '${shape}'" >&2
+        exit 2
+        ;;
+    esac
+  done
+  if ! [[ "${BENCH_FILE_COMPRESSION_SPREAD}" =~ ^[0-9]+$ ]] \
+    || [ "${BENCH_FILE_COMPRESSION_SPREAD}" -gt 100 ]; then
+    echo "bench.env: BENCH_FILE_COMPRESSION_SPREAD must be within 0..=100" >&2
+    exit 2
+  fi
   if ! [[ "${BENCH_FILE_COMPRESSION_PCTS}" =~ ^[0-9]+(,[0-9]+)+$ ]]; then
     echo "bench.env: BENCH_FILE_COMPRESSION_PCTS must be a comma-separated list of at least two percentages" >&2
     exit 2
@@ -103,6 +118,8 @@ sed -e "s|__RUN_ID_B64__|$(encode "${RUN_ID}")|g" \
   -e "s|__FILE_COMPRESSION_PCTS_B64__|$(encode "${BENCH_FILE_COMPRESSION_PCTS:-}")|g" \
   -e "s|__FILE_COMPRESSION_DATASET_MIB_B64__|$(encode "${BENCH_FILE_COMPRESSION_DATASET_MIB:-}")|g" \
   -e "s|__FILE_COMPRESSION_FRACTION_B64__|$(encode "${BENCH_FILE_COMPRESSION_FRACTION:-}")|g" \
+  -e "s|__FILE_COMPRESSION_SHAPES_B64__|$(encode "${BENCH_FILE_COMPRESSION_SHAPES:-}")|g" \
+  -e "s|__FILE_COMPRESSION_SPREAD_B64__|$(encode "${BENCH_FILE_COMPRESSION_SPREAD:-}")|g" \
   -e "s|__MAX_MINUTES__|${MAX_MINUTES}|g" \
   "${SCRIPT_DIR}/user-data.sh.tpl" > "${UD_FILE}"
 
