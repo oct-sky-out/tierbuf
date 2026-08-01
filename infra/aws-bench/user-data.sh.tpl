@@ -3,6 +3,11 @@
 set -uo pipefail
 exec > /var/log/tierbuf-bench.log 2>&1
 
+# cloud-init runs user-data as root without exporting HOME. rustup's
+# generated /root/.cargo/env references $HOME, so `set -u` kills the script
+# the instant it's sourced unless HOME is set explicitly first.
+export HOME=/root
+
 decode() {
   printf '%s' "$1" | base64 --decode
 }
