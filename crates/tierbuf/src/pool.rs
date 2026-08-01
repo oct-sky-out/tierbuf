@@ -2987,6 +2987,12 @@ mod tests {
     #[test]
     fn pinned_frame_is_never_selected_for_eviction() {
         let manager = manager(1, 0);
+        // A one-frame pool has exactly one cooling ticket. The background
+        // cooler competes for that ticket, and `acquire_frame` only samples the
+        // queue `windows + 2` times, so a cooler that holds the ticket across
+        // all three attempts makes the reclaiming allocate below fail
+        // spuriously. Demand eviction alone proves the invariant.
+        stop_background_workers(&manager);
         let mut pinned = manager.allocate().expect("pinned allocation");
         let swip = pinned.swip();
         pinned.write_with(|page| page[0] = 0x6d);
