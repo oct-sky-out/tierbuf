@@ -242,6 +242,19 @@ two throughputs break even, writing `crossover.csv` beside the per-run
 artifacts. Set `BENCH_FILE_COMPRESSION_DEMO=1` in `infra/aws-bench/bench.env`
 to run it on real EC2 NVMe, where the `io_uring` path is actually available.
 
+Two payload knobs keep the measurement away from one artificial best case.
+`--payload-shape chunked` replaces the single zero prefix with variable-length
+runs whose repeated tokens differ per run, and `--payload-spread PCT` draws each
+page's own compressibility around the target so the dataset holds a range of
+ratios rather than one value. The benchmark stats JSON reports the mean,
+minimum, and maximum LZ4 ratio actually achieved:
+
+| shape | target | spread | mean ratio | observed range |
+| --- | --- | --- | --- | --- |
+| `uniform` | 50% | 0 | 0.5045 | 0.5045-0.5045 |
+| `chunked` | 50% | 0 | 0.5096 | 0.4644-0.5536 |
+| `chunked` | 50% | 30 | 0.5221 | 0.2291-0.7722 |
+
 The checker rejects any adjacent DRAM-fraction pair whose throughput ratio is
 greater than 3.0 or whose p99 ratio is greater than 4.0. Scheduled CI publishes
 the full 4 GiB CSV and graph; the curve below is the first reference hardware

@@ -8,15 +8,19 @@ All notable changes to tierbuf are documented here. The format follows
 
 ### Added
 
-- `tierbuf-bench --file-compression on|off` selects the FileTier LZ4 codec, and
-  `--payload-compressibility PCT` shapes how compressible generated pages are.
-  The default of 100 reproduces the previous all-zero payload exactly, so
+- `tierbuf-bench --file-compression on|off` selects the FileTier LZ4 codec,
+  `--payload-compressibility PCT` targets how compressible generated pages are,
+  `--payload-shape uniform|chunked` selects the structure inside each page, and
+  `--payload-spread PCT` varies compressibility across pages so one dataset
+  holds a distribution of ratios. The defaults (`uniform`, spread 0,
+  compressibility 100) reproduce the previous all-zero payload exactly, so
   earlier results stay comparable.
 - `scripts/file_compression_demo.py` sweeps both compression modes across
   payload compressibility and reports the break-even point, with EC2 support
   through `BENCH_FILE_COMPRESSION_DEMO` in the AWS harness.
 - Benchmark stats JSON records a per-run `payload` descriptor holding the
-  requested compressibility, the file-tier codec, and the sampled LZ4 ratio.
+  requested shape, compressibility, spread, the file-tier codec, and the mean,
+  minimum, and maximum LZ4 ratios sampled across generated pages.
 
 ### Changed
 
