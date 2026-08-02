@@ -2,8 +2,6 @@
 
 **DRAM, NVMe, and S3 managed as one embeddable page space.**
 
-**DRAM 가격 위기에 대한 아키텍처적 응답.**
-
 tierbuf is a Rust buffer-manager kernel built around fixed 64 KiB pages,
 aligned DRAM frames, and explicit lower storage tiers. It gives storage engines
 a small mechanism layer they can embed instead of coupling them to an async
@@ -193,6 +191,10 @@ tierbuf cost: actual $0.000000001, all-DRAM $0.000000004 (0.250x)
 ```
 
 ## Degradation curve
+
+The measurement-correctness gates, S3 run profiles, compression remeasurement,
+and mixed-load expansion are specified in the
+[benchmark reliability and load-test plan](docs/benchmark-test-plan.md).
 
 ```bash
 cargo run -p tierbuf-bench --release -- --quick

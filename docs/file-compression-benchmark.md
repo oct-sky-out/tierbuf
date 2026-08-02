@@ -1,5 +1,38 @@
 # FileTier compression: measured crossover
 
+> [!WARNING]
+> **Superseded pending remeasurement (T19). Do not cite the numbers in this
+> document.**
+>
+> Three harness defects were found in this run after publication. All are
+> tracked in [Benchmark reliability and load-test plan](benchmark-test-plan.md).
+>
+> 1. **No run reached steady state.** Cumulative tier writes (129,063) never
+>    reached the dataset page count (131,072), so initialization dirty
+>    write-back was still draining when measurement ended. The fixed 10-second
+>    warmup was insufficient.
+> 2. **The residual write-back is asymmetric between arms.** Compression-off
+>    averaged 12,570 measurement-window tier writes; compression-on averaged
+>    17,233, about 37% more — and compression-on writes are LZ4-encoded, so the
+>    confound burns CPU only in the treatment arm. Its magnitude is the same
+>    order as the effect being measured. **The sign of the `chunked` result is
+>    therefore not established.**
+> 3. **The control arm is device-clamped, not stable.** Tier reads in all twelve
+>    compression-off runs are identical to the digit (160,535 in 30.0007 s =
+>    5,351 reads/s = 94% of the 5,684 IOPS `fio` ceiling). The "1.1% control
+>    range" cited below is saturation, not reproducibility, and says nothing
+>    about variance in the unsaturated compression-on arm — where **every point
+>    is a single run**.
+>
+> Consequently the 66.1% crossover, the 1.046x and 1.219x speedups, and the
+> conclusion that no operating point is worth enabling are all unsupported as
+> stated. Two claims do survive, because they are structural rather than
+> measured: fixed 64 KiB slots cannot gain capacity from compression, and a
+> compressing tier withholds its raw descriptor (`crates/tierbuf/src/tier/file.rs:387`)
+> and so gives up the `io_uring` read path.
+>
+> The tables are retained unchanged as a historical artifact.
+
 Fixed 64 KiB slots mean LZ4 never adds capacity to a file tier, so compression
 trades CPU time and the `io_uring` read path for fewer transferred bytes. A
 compression-capable tier withholds its raw descriptor, because `io_uring` would
